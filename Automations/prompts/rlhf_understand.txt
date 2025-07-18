@@ -1,0 +1,74 @@
+🔎 Input Structure
+
+You have been provided with a JSON file containing structured human annotation data for the project "Ads Storyboard Generation". The structure follows a typical RLHF-style format with two top-level sections:
+
+- `sft[]`: Task metadata captured before, during, and after annotation
+- `rlhf[]`: Human-labeled content, containing prompts, metadata, and evaluation form outputs
+
+---
+
+## 🔹 Section 1: `sft[]`
+
+This array captures one entry per annotation task. Your job is to:
+
+- List all keys found under each `sft[]` item
+- Provide a description for each field
+- Indicate whether it’s likely important for downstream delivery (yes/no)
+
+Pay special attention to fields like:
+- `id`, `completedAt`, `colabLink`, `statement`, `humanRoleId`, `workItem_id`
+- Any nested values like `seed.metadata`, which include:
+  - Descriptive fields: `desc`, `item_name`, `projectName`
+  - Image metadata: `image1_link`, `image1_name`, ..., `image5_name`
+
+Use bullet points grouped by relevance: identifiers, timestamps, metadata, annotator info.
+
+---
+
+## 🔹 Section 2: `rlhf[]`
+
+Each element in this list is a task completed by a human. For each task, inspect and describe the keys that are actually present. In particular:
+
+- **Top-level fields**:
+  - `taskId`: Explain as the unique identifier matching `sft.id`
+  - `task.colabLink`: Link to the UI where annotation was performed
+  - `metadata.scope_requirements`: Explain this as a rich dictionary of structured values like `desc`, `item_name`, `batchId`, `projectId`, image links/names, suggestions
+
+- **Messages[] block**:
+  - List how many messages exist
+  - For each message, show what `role` it has (e.g., "user", "assistant")
+  - If any `assistant` message includes `signal.human_evals[].evaluation_form`, explain the structure:
+    - `question`: Field name for the annotation
+    - `human_input_value`: The actual annotation text/value
+
+- If `evaluation_form` is present:
+  - Group fields by clip if recognizable (e.g., "clip 1_description")
+  - Mention how many questions are answered
+  - Note any `N/A` or empty answers
+
+---
+
+🧠 Analysis Expectations
+
+- Do NOT list fields that are not present in the actual uploaded JSON
+- If certain fields like `evaluation_form`, `colabLink`, or `workItem_id` are missing, clearly say so
+- Give a human-friendly summary of how a single task flows:
+  - Metadata from `sft`
+  - Task content in `rlhf`
+  - Annotations from `evaluation_form`
+
+---
+
+📦 Output Format
+
+Use sections like:
+- “Task Identification”
+- “Annotator Info”
+- “Image Metadata”
+- “Evaluation Form Structure”
+
+Use bullet points, avoid code blocks unless you’re showing field-value pairs.
+
+---
+
+✅ Let me know if you'd like to extract specific fields into a summary table or convert this into a client-ready delivery JSON.
