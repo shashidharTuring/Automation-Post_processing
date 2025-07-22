@@ -125,7 +125,14 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 # =============================================================================
 # MAIN PAGE TABS
 # =============================================================================
-main_tab, json_tab = st.tabs(["📂 RLHF Viewer", "🧠 JSON Viewer"])
+st.title("🔍 Choose Viewer Mode")
+option = st.radio(
+    label="Select a Viewer",
+    options=["Home", "RLHF Viewer", "JSON Visualizer"],
+    index=0,
+    horizontal=True
+)
+
 
 
 # =============================================================================
@@ -409,82 +416,81 @@ def build_delivery_json_from_ingestion(
 
 
 # =============================================================================
-# SIDEBAR – DELIVERY RLHF JSON
-# =============================================================================
-st.sidebar.header("📁 Upload RLHF Delivery JSON")
-json_file = st.sidebar.file_uploader(
-    "Upload delivery JSON", type="json", key="delivery_json_uploader"
-)
-
-if not json_file:
-    st.info("👈 Upload a Delivery RLHF JSON to begin.")
-    st.stop()
-
-data = load_json(json_file)
-if data is None:
-    st.stop()
-
-if "rlhf" not in data:
-    st.error("❌ Uploaded JSON missing top-level `rlhf` key.")
-    st.stop()
-if "sft" not in data:
-    st.error("❌ Uploaded JSON missing top-level `sft` key.")
-    st.stop()
-
-rlhf_tasks = data["rlhf"]
-data_sft = data["sft"]
-
-annotator_task_df = build_annotator_task_df(data_sft)
-task_id_map = {str(task["taskId"]): task for task in rlhf_tasks if "taskId" in task}
-if not task_id_map:
-    st.warning("⚠️ No valid RLHF tasks with `taskId` found.")
-    st.stop()
-
-data_csv = compile_task_rows(task_id_map, data_sft, annotator_task_df)
-
-
-# =============================================================================
-# KPI STRIP
-# =============================================================================
-total_tasks = len(task_id_map)
-unique_annotators = annotator_task_df["AnnotatorID"].nunique()
-scope_cat = data_csv["scope_category"] if "scope_category" in data_csv.columns else None
-unique_categories = int(scope_cat.nunique()) if scope_cat is not None else 0
-scope_batch = data_csv["scope_batchId"] if "scope_batchId" in data_csv.columns else None
-unique_batches = int(scope_batch.nunique()) if scope_batch is not None else 0
-
-k1, k2, k3, k4 = st.columns(4)
-with k1:
-    st.markdown(
-        f"<div class='rlhf-kpi-value'>{total_tasks}</div>"
-        "<div class='rlhf-kpi-label'>Tasks</div>",
-        unsafe_allow_html=True,
-    )
-with k2:
-    st.markdown(
-        f"<div class='rlhf-kpi-value'>{unique_annotators}</div>"
-        "<div class='rlhf-kpi-label'>Annotators</div>",
-        unsafe_allow_html=True,
-    )
-with k3:
-    st.markdown(
-        f"<div class='rlhf-kpi-value'>{unique_categories}</div>"
-        "<div class='rlhf-kpi-label'>Categories</div>",
-        unsafe_allow_html=True,
-    )
-with k4:
-    st.markdown(
-        f"<div class='rlhf-kpi-value'>{unique_batches}</div>"
-        "<div class='rlhf-kpi-label'>Batches</div>",
-        unsafe_allow_html=True,
-    )
-
-
-# =============================================================================
 # TABS
 # =============================================================================
-with main_tab:
+if option == "RLHF Viewer":
     st.title("🧠 RLHF Task Viewer")
+
+    # =============================================================================
+    # SIDEBAR – DELIVERY RLHF JSON
+    # =============================================================================
+    st.sidebar.header("📁 Upload RLHF Delivery JSON")
+    json_file = st.sidebar.file_uploader(
+        "Upload delivery JSON", type="json", key="delivery_json_uploader"
+    )
+
+    if not json_file:
+        st.info("👈 Upload a Delivery RLHF JSON to begin.")
+        st.stop()
+
+    data = load_json(json_file)
+    if data is None:
+        st.stop()
+
+    if "rlhf" not in data:
+        st.error("❌ Uploaded JSON missing top-level `rlhf` key.")
+        st.stop()
+    if "sft" not in data:
+        st.error("❌ Uploaded JSON missing top-level `sft` key.")
+        st.stop()
+
+    rlhf_tasks = data["rlhf"]
+    data_sft = data["sft"]
+
+    annotator_task_df = build_annotator_task_df(data_sft)
+    task_id_map = {str(task["taskId"]): task for task in rlhf_tasks if "taskId" in task}
+    if not task_id_map:
+        st.warning("⚠️ No valid RLHF tasks with `taskId` found.")
+        st.stop()
+
+    data_csv = compile_task_rows(task_id_map, data_sft, annotator_task_df)
+
+
+    # =============================================================================
+    # KPI STRIP
+    # =============================================================================
+    total_tasks = len(task_id_map)
+    unique_annotators = annotator_task_df["AnnotatorID"].nunique()
+    scope_cat = data_csv["scope_category"] if "scope_category" in data_csv.columns else None
+    unique_categories = int(scope_cat.nunique()) if scope_cat is not None else 0
+    scope_batch = data_csv["scope_batchId"] if "scope_batchId" in data_csv.columns else None
+    unique_batches = int(scope_batch.nunique()) if scope_batch is not None else 0
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.markdown(
+            f"<div class='rlhf-kpi-value'>{total_tasks}</div>"
+            "<div class='rlhf-kpi-label'>Tasks</div>",
+            unsafe_allow_html=True,
+        )
+    with k2:
+        st.markdown(
+            f"<div class='rlhf-kpi-value'>{unique_annotators}</div>"
+            "<div class='rlhf-kpi-label'>Annotators</div>",
+            unsafe_allow_html=True,
+        )
+    with k3:
+        st.markdown(
+            f"<div class='rlhf-kpi-value'>{unique_categories}</div>"
+            "<div class='rlhf-kpi-label'>Categories</div>",
+            unsafe_allow_html=True,
+        )
+    with k4:
+        st.markdown(
+            f"<div class='rlhf-kpi-value'>{unique_batches}</div>"
+            "<div class='rlhf-kpi-label'>Batches</div>",
+            unsafe_allow_html=True,
+        )
 
     inspect_tab, csv_tab, delivery_tab, validator_tab = st.tabs(
         [
@@ -494,313 +500,316 @@ with main_tab:
             "✅ Validator (placeholder)"
         ]
     )
+    
 
 
-# =============================================================================
-# TAB 1 – INSPECT TASK
-# =============================================================================
-with inspect_tab:
-    st.subheader("Inspect a Single Task")
+    # =============================================================================
+    # TAB 1 – INSPECT TASK
+    # =============================================================================
+    with inspect_tab:
+        st.subheader("Inspect a Single Task")
 
-    selected_task_id = st.selectbox(
-        "Select a Task ID", list(task_id_map.keys()), key="inspect_task_id_select"
-    )
+        selected_task_id = st.selectbox(
+            "Select a Task ID", list(task_id_map.keys()), key="inspect_task_id_select"
+        )
 
-    if selected_task_id:
-        task = task_id_map[selected_task_id]
+        if selected_task_id:
+            task = task_id_map[selected_task_id]
 
-        # wider message column
-        meta_col, msg_col = st.columns([0.9, 2.1])
+            # wider message column
+            meta_col, msg_col = st.columns([0.9, 2.1])
 
-        # --- metadata / scope -----------------------------------------------------
-        with meta_col:
-            st.markdown(f"### 📄 Task `{selected_task_id}`")
-            colab_link = task.get("task", {}).get("colabLink", "N/A")
-            st.markdown(f"🔗 **RLHF Link**: [Open Task]({colab_link})")
+            # --- metadata / scope -----------------------------------------------------
+            with meta_col:
+                st.markdown(f"### 📄 Task `{selected_task_id}`")
+                colab_link = task.get("task", {}).get("colabLink", "N/A")
+                st.markdown(f"🔗 **RLHF Link**: [Open Task]({colab_link})")
 
-            st.markdown("#### 📘 Scope")
-            scope = task.get("metadata", {}).get("scope_requirements", {})
-            scope_rows = [{"Key": k, "Value": str(v)} for k, v in scope.items()]
+                st.markdown("#### 📘 Scope")
+                scope = task.get("metadata", {}).get("scope_requirements", {})
+                scope_rows = [{"Key": k, "Value": str(v)} for k, v in scope.items()]
 
-            # annotator
-            try:
-                annotator_id_list = annotator_task_df[
-                    annotator_task_df["task_id"] == int(selected_task_id)
-                ]["AnnotatorID"].tolist()
-                annotator_id = annotator_id_list[0] if annotator_id_list else "NA"
-            except Exception:  # noqa: BLE001
-                annotator_id = "NA"
-            scope_rows.append({"Key": "annotator_id", "Value": annotator_id})
+                # annotator
+                try:
+                    annotator_id_list = annotator_task_df[
+                        annotator_task_df["task_id"] == int(selected_task_id)
+                    ]["AnnotatorID"].tolist()
+                    annotator_id = annotator_id_list[0] if annotator_id_list else "NA"
+                except Exception:  # noqa: BLE001
+                    annotator_id = "NA"
+                scope_rows.append({"Key": "annotator_id", "Value": annotator_id})
 
-            scope_df = pd.DataFrame(scope_rows)
-            scope_df.columns = ["Key", "Value"]
+                scope_df = pd.DataFrame(scope_rows)
+                scope_df.columns = ["Key", "Value"]
 
-            # clickable link for http
-            def _mk_link(v):
-                if isinstance(v, str) and v.startswith("http"):
-                    return f"[link]({v})"
-                return v
+                # clickable link for http
+                def _mk_link(v):
+                    if isinstance(v, str) and v.startswith("http"):
+                        return f"[link]({v})"
+                    return v
 
-            scope_df["Value"] = scope_df["Value"].apply(_mk_link)
+                scope_df["Value"] = scope_df["Value"].apply(_mk_link)
 
-            st.dataframe(
-                scope_df.set_index("Key"),
-                use_container_width=True,
-                height=min(400, 35 * len(scope_df) + 40),
-            )
-
-        # --- messages -------------------------------------------------------------
-        with msg_col:
-            st.markdown("### 💬 Messages")
-            messages = task.get("messages", [])
-            for i, msg in enumerate(messages, start=1):
-                role_raw = msg.get("role", "")
-                role = role_raw.capitalize()
-                badge_class = (
-                    "rlhf-badge-user"
-                    if role == "User"
-                    else "rlhf-badge-assistant" if role == "Assistant" else ""
+                st.dataframe(
+                    scope_df.set_index("Key"),
+                    use_container_width=True,
+                    height=min(400, 35 * len(scope_df) + 40),
                 )
 
-                with st.expander(f"{role} msg #{i}", expanded=(i == 1)):
-                    st.markdown(
-                        f"<span class='{badge_class}'>{role}</span>",
-                        unsafe_allow_html=True,
+            # --- messages -------------------------------------------------------------
+            with msg_col:
+                st.markdown("### 💬 Messages")
+                messages = task.get("messages", [])
+                for i, msg in enumerate(messages, start=1):
+                    role_raw = msg.get("role", "")
+                    role = role_raw.capitalize()
+                    badge_class = (
+                        "rlhf-badge-user"
+                        if role == "User"
+                        else "rlhf-badge-assistant" if role == "Assistant" else ""
                     )
-                    if role == "User":
-                        prompt_text = msg.get("text", "")
-                        st.markdown("**Prompt (text):**")
-                        st.code(prompt_text)
 
-                        st.markdown("**Other Fields in User Message**")
-                        for key, val in msg.items():
-                            if key in ["text", "role"]:
-                                continue
-                            st.markdown(f"##### ▸ {key}")
-                            if key == "prompt_evaluation" and isinstance(val, list):
-                                rows = [
-                                    {
-                                        "Question": item.get("question", ""),
-                                        "Description": item.get("description", ""),
-                                        "Human Answer": item.get(
-                                            "human_input_value", ""
-                                        ),
-                                    }
-                                    for item in val
-                                ]
-                                _safe_show_eval_rows(rows)
-                            else:
-                                if isinstance(val, (dict, list)):
-                                    st.json(val)
+                    with st.expander(f"{role} msg #{i}", expanded=(i == 1)):
+                        st.markdown(
+                            f"<span class='{badge_class}'>{role}</span>",
+                            unsafe_allow_html=True,
+                        )
+                        if role == "User":
+                            prompt_text = msg.get("text", "")
+                            st.markdown("**Prompt (text):**")
+                            st.code(prompt_text)
+
+                            st.markdown("**Other Fields in User Message**")
+                            for key, val in msg.items():
+                                if key in ["text", "role"]:
+                                    continue
+                                st.markdown(f"##### ▸ {key}")
+                                if key == "prompt_evaluation" and isinstance(val, list):
+                                    rows = [
+                                        {
+                                            "Question": item.get("question", ""),
+                                            "Description": item.get("description", ""),
+                                            "Human Answer": item.get(
+                                                "human_input_value", ""
+                                            ),
+                                        }
+                                        for item in val
+                                    ]
+                                    _safe_show_eval_rows(rows)
                                 else:
-                                    st.write(val)
+                                    if isinstance(val, (dict, list)):
+                                        st.json(val)
+                                    else:
+                                        st.write(val)
 
-                    elif role == "Assistant":
-                        signal = msg.get("signal", {})
-                        ideal_response = signal.get("ideal_response")
-                        if ideal_response:
-                            st.markdown("**💡 Ideal Response:**")
-                            st.code(ideal_response)
+                        elif role == "Assistant":
+                            signal = msg.get("signal", {})
+                            ideal_response = signal.get("ideal_response")
+                            if ideal_response:
+                                st.markdown("**💡 Ideal Response:**")
+                                st.code(ideal_response)
 
-                        human_evals = signal.get("human_evals", [])
-                        for eval_set in human_evals:
-                            eval_form = eval_set.get("evaluation_form", [])
-                            if eval_form:
-                                st.markdown("**🧾 Human Evaluation Table:**")
-                                rows = [
-                                    {
-                                        "Question": item.get("question", ""),
-                                        "Description": item.get("description", ""),
-                                        "Human Answer": item.get(
-                                            "human_input_value", ""
-                                        ),
-                                    }
-                                    for item in eval_form
-                                ]
-                                _safe_show_eval_rows(rows)
+                            human_evals = signal.get("human_evals", [])
+                            for eval_set in human_evals:
+                                eval_form = eval_set.get("evaluation_form", [])
+                                if eval_form:
+                                    st.markdown("**🧾 Human Evaluation Table:**")
+                                    rows = [
+                                        {
+                                            "Question": item.get("question", ""),
+                                            "Description": item.get("description", ""),
+                                            "Human Answer": item.get(
+                                                "human_input_value", ""
+                                            ),
+                                        }
+                                        for item in eval_form
+                                    ]
+                                    _safe_show_eval_rows(rows)
 
 
-# =============================================================================
-# TAB 2 – VIEW CSV + FILTERS
-# =============================================================================
-with csv_tab:
-    st.subheader("Compiled Task Table")
-    st.caption(
-        "Filters available for: task_id, scope_category, scope_batchName, scope_batchId."
-    )
-
-    if data_csv.empty:
-        st.warning("No compiled task rows.")
-    else:
-        with st.expander("🔍 Add Filters", expanded=False):
-            filtered_df = filter_dataframe(data_csv, allowed_cols=ALLOWED_FILTER_COLS)
-
-        if "filtered_df" not in locals():
-            filtered_df = data_csv.copy()
-
-        st.markdown(
-            f"**Showing {len(filtered_df):,} of {len(data_csv):,} rows.**",
-            unsafe_allow_html=True,
+    # =============================================================================
+    # TAB 2 – VIEW CSV + FILTERS
+    # =============================================================================
+    with csv_tab:
+        st.subheader("Compiled Task Table")
+        st.caption(
+            "Filters available for: task_id, scope_category, scope_batchName, scope_batchId."
         )
 
-        st.dataframe(filtered_df, use_container_width=True)
+        if data_csv.empty:
+            st.warning("No compiled task rows.")
+        else:
+            with st.expander("🔍 Add Filters", expanded=False):
+                filtered_df = filter_dataframe(data_csv, allowed_cols=ALLOWED_FILTER_COLS)
 
-        st.markdown("<div class='rlhf-toolbar-sticky'></div>", unsafe_allow_html=True)
-        full_buf = io.StringIO()
-        data_csv.to_csv(full_buf, index=False)
-        filt_buf = io.StringIO()
-        filtered_df.to_csv(filt_buf, index=False)
-        col_dl1, col_dl2 = st.columns(2)
-        with col_dl1:
-            st.download_button(
-                label="⬇️ Download FULL CSV",
-                data=full_buf.getvalue(),
-                file_name="rlhf_tasks_export_full.csv",
-                mime="text/csv",
-            )
-        with col_dl2:
-            st.download_button(
-                label="⬇️ Download FILTERED CSV",
-                data=filt_buf.getvalue(),
-                file_name="rlhf_tasks_export_filtered.csv",
-                mime="text/csv",
-            )
-
-
-# =============================================================================
-# TAB 3 – DELIVERY BATCH CREATOR
-# =============================================================================
-with delivery_tab:
-    st.subheader("Delivery Batch Creator")
-    st.caption(
-        "Upload an *Ingestion JSON* (work items) below. We'll build a Delivery payload from the compiled tasks."
-    )
-
-    ingestion_file = st.file_uploader(
-        "Upload Ingestion JSON", type="json", key="ingestion_json_uploader_tab"
-    )
-    ingestion_data = load_json(ingestion_file)
-
-    if ingestion_file and ingestion_data is None:
-        st.stop()
-
-    if ingestion_data is None:
-        st.info("Upload an ingestion JSON to enable batch creation.")
-    else:
-        st.success("Ingestion JSON loaded.")
-
-        final_json_dict = build_delivery_json_from_ingestion(
-            ingestion_data=ingestion_data,
-            data_csv=data_csv,
-            data_sft=data_sft,
-            pdf_col="scope_pdf_name",
-        )
-
-        if final_json_dict:
-            workitems = final_json_dict.get("workitems", [])
-            total_wi = len(workitems)
-            show_max = 3
+            if "filtered_df" not in locals():
+                filtered_df = data_csv.copy()
 
             st.markdown(
-                f"<div class='rlhf-delivery-summary'>Total workitems built: "
-                f"<strong>{total_wi}</strong>. Showing first {min(show_max, total_wi)} below.</div>",
+                f"**Showing {len(filtered_df):,} of {len(data_csv):,} rows.**",
                 unsafe_allow_html=True,
             )
 
-            preview_dict = dict(final_json_dict)
-            preview_dict["workitems"] = workitems[:show_max]
+            st.dataframe(filtered_df, use_container_width=True)
 
-            expand_full = st.checkbox(
-                "Show full JSON inline (may be large)", value=False, key="show_full_json"
-            )
-            if expand_full:
-                st.json(final_json_dict)
-            else:
-                st.json(preview_dict)
+            st.markdown("<div class='rlhf-toolbar-sticky'></div>", unsafe_allow_html=True)
+            full_buf = io.StringIO()
+            data_csv.to_csv(full_buf, index=False)
+            filt_buf = io.StringIO()
+            filtered_df.to_csv(filt_buf, index=False)
+            col_dl1, col_dl2 = st.columns(2)
+            with col_dl1:
+                st.download_button(
+                    label="⬇️ Download FULL CSV",
+                    data=full_buf.getvalue(),
+                    file_name="rlhf_tasks_export_full.csv",
+                    mime="text/csv",
+                )
+            with col_dl2:
+                st.download_button(
+                    label="⬇️ Download FILTERED CSV",
+                    data=filt_buf.getvalue(),
+                    file_name="rlhf_tasks_export_filtered.csv",
+                    mime="text/csv",
+                )
 
-            # download full JSON
-            final_json_str = json.dumps(final_json_dict, ensure_ascii=False, indent=2)
-            final_json_bytes = final_json_str.encode("utf-8")
-            fname = timestamped_json_filename()
 
-            st.download_button(
-                label="📦 Download FULL Final JSON",
-                data=final_json_bytes,
-                file_name=fname,
-                mime="application/json",
-                key="download_final_json_tab",
-            )
+    # =============================================================================
+    # TAB 3 – DELIVERY BATCH CREATOR
+    # =============================================================================
+    with delivery_tab:
+        st.subheader("Delivery Batch Creator")
+        st.caption(
+            "Upload an *Ingestion JSON* (work items) below. We'll build a Delivery payload from the compiled tasks."
+        )
 
-            # download CSV
-            csv_buf = io.StringIO()
-            data_csv.to_csv(csv_buf, index=False)
-            st.download_button(
-                label="🧾 Download Task CSV",
-                data=csv_buf.getvalue(),
-                file_name="rlhf_tasks_export.csv",
-                mime="text/csv",
-                key="download_task_csv_tab",
-            )
+        ingestion_file = st.file_uploader(
+            "Upload Ingestion JSON", type="json", key="ingestion_json_uploader_tab"
+        )
+        ingestion_data = load_json(ingestion_file)
+
+        if ingestion_file and ingestion_data is None:
+            st.stop()
+
+        if ingestion_data is None:
+            st.info("Upload an ingestion JSON to enable batch creation.")
         else:
-            st.warning("No delivery batch could be built (see warnings/errors above).")
+            st.success("Ingestion JSON loaded.")
+
+            final_json_dict = build_delivery_json_from_ingestion(
+                ingestion_data=ingestion_data,
+                data_csv=data_csv,
+                data_sft=data_sft,
+                pdf_col="scope_pdf_name",
+            )
+
+            if final_json_dict:
+                workitems = final_json_dict.get("workitems", [])
+                total_wi = len(workitems)
+                show_max = 3
+
+                st.markdown(
+                    f"<div class='rlhf-delivery-summary'>Total workitems built: "
+                    f"<strong>{total_wi}</strong>. Showing first {min(show_max, total_wi)} below.</div>",
+                    unsafe_allow_html=True,
+                )
+
+                preview_dict = dict(final_json_dict)
+                preview_dict["workitems"] = workitems[:show_max]
+
+                expand_full = st.checkbox(
+                    "Show full JSON inline (may be large)", value=False, key="show_full_json"
+                )
+                if expand_full:
+                    st.json(final_json_dict)
+                else:
+                    st.json(preview_dict)
+
+                # download full JSON
+                final_json_str = json.dumps(final_json_dict, ensure_ascii=False, indent=2)
+                final_json_bytes = final_json_str.encode("utf-8")
+                fname = timestamped_json_filename()
+
+                st.download_button(
+                    label="📦 Download FULL Final JSON",
+                    data=final_json_bytes,
+                    file_name=fname,
+                    mime="application/json",
+                    key="download_final_json_tab",
+                )
+
+                # download CSV
+                csv_buf = io.StringIO()
+                data_csv.to_csv(csv_buf, index=False)
+                st.download_button(
+                    label="🧾 Download Task CSV",
+                    data=csv_buf.getvalue(),
+                    file_name="rlhf_tasks_export.csv",
+                    mime="text/csv",
+                    key="download_task_csv_tab",
+                )
+            else:
+                st.warning("No delivery batch could be built (see warnings/errors above).")
 
 
-# =============================================================================
-# TAB 4 – VALIDATOR (placeholder)
-# =============================================================================
-with validator_tab:
-    st.subheader("Validator – Coming Soon")
-    st.caption("Upload an output schema file for future validation (no logic yet).")
-    st.markdown(
-        "<div class='rlhf-dropzone'>Drop a schema file below (JSON, CSV, XLSX, YAML). Validation not yet implemented.</div>",
-        unsafe_allow_html=True,
-    )
+    # =============================================================================
+    # TAB 4 – VALIDATOR (placeholder)
+    # =============================================================================
+    with validator_tab:
+        st.subheader("Validator – Coming Soon")
+        st.caption("Upload an output schema file for future validation (no logic yet).")
+        st.markdown(
+            "<div class='rlhf-dropzone'>Drop a schema file below (JSON, CSV, XLSX, YAML). Validation not yet implemented.</div>",
+            unsafe_allow_html=True,
+        )
 
-    validator_file = st.file_uploader(
-        "Upload Output Schema File",
-        type=["json", "csv", "xlsx", "yaml", "yml"],
-        key="validator_schema_uploader",
-    )
+        validator_file = st.file_uploader(
+            "Upload Output Schema File",
+            type=["json", "csv", "xlsx", "yaml", "yml"],
+            key="validator_schema_uploader",
+        )
 
-    if validator_file is not None:
-        st.info("File received. Validation logic not yet implemented.")
-    else:
-        st.write("No schema uploaded yet.")
+        if validator_file is not None:
+            st.info("File received. Validation logic not yet implemented.")
+        else:
+            st.write("No schema uploaded yet.")
+
+
 # =============================================================================
 # JSON VISUALIZER TAB (Standalone)
 # =============================================================================
-with json_tab:
+elif option == "JSON Visualizer":
     st.title("📊 JSON Visualizer & Explainer (Powered by GPT-4o)")
 
     st.markdown("### 📁 Upload Your JSON File")
     json_file = st.file_uploader("Upload JSON File", type="json", key="visualizer_json_uploader")
 
-    load_dotenv()
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-    if not OPENAI_API_KEY:
-        st.error("❌ OpenAI API key not found in .env file")
-        st.stop()
-
-    client = openai.OpenAI(api_key=OPENAI_API_KEY)
-
-    json_data = None
     if json_file:
+        load_dotenv()
+        OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+        if not OPENAI_API_KEY:
+            st.error("❌ OpenAI API key not found in .env file")
+            st.stop()
+
+        client = openai.OpenAI(api_key=OPENAI_API_KEY)
+
+        json_data = None
         try:
             json_data = json.load(json_file)
         except Exception as e:
             st.error(f"❌ Failed to read JSON: {str(e)}")
 
-    if json_data:
-        st.subheader("📄 Uploaded JSON")
-        st.json(json_data)
+        if json_data:
+            st.subheader("📄 Uploaded JSON")
+            st.json(json_data)
 
-        with st.spinner("Analyzing uploaded JSON in context with GPT-4o..."):
-            try:
-                sample_summary = json.dumps(json_data, indent=2)
-                if len(sample_summary) > 10000:
-                    sample_summary = sample_summary[:10000] + "\n...\n[TRUNCATED FOR ANALYSIS]"
+            with st.spinner("Analyzing uploaded JSON in context with GPT-4o..."):
+                try:
+                    sample_summary = json.dumps(json_data, indent=2)
+                    if len(sample_summary) > 10000:
+                        sample_summary = sample_summary[:10000] + "\n...\n[TRUNCATED FOR ANALYSIS]"
 
-                prompt = f"""
+                    prompt = f"""
 You are a JSON specialist. Please deeply analyze the *uploaded JSON* (provided below). Your output must follow this format:
 
 ### 1️⃣ JSON Format & Structure
@@ -827,29 +836,29 @@ Prepare a table with the following columns:
 ```
 """
 
-                response = client.chat.completions.create(
-                    model="gpt-4o-2024-05-13",
-                    messages=[
-                        {"role": "system", "content": (
-                            "You are a reasoning expert and a JSON analysis specialist. "
-                            "Your job is to deeply analyze uploaded JSON data with step-by-step logic, clear formatting, and structured breakdowns."
-                        )},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.7,
-                    max_tokens=4096,
-                    stream=True
-                )
+                    response = client.chat.completions.create(
+                        model="gpt-4o-2024-05-13",
+                        messages=[
+                            {"role": "system", "content": (
+                                "You are a reasoning expert and a JSON analysis specialist. "
+                                "Your job is to deeply analyze uploaded JSON data with step-by-step logic, clear formatting, and structured breakdowns."
+                            )},
+                            {"role": "user", "content": prompt}
+                        ],
+                        temperature=0.7,
+                        max_tokens=4096,
+                        stream=True
+                    )
 
-                full_output = ""
-                for chunk in response:
-                    if chunk.choices[0].delta.content:
-                        full_output += chunk.choices[0].delta.content
+                    full_output = ""
+                    for chunk in response:
+                        if chunk.choices[0].delta.content:
+                            full_output += chunk.choices[0].delta.content
 
-                st.markdown("### 🧠 Uploaded JSON: Full Breakdown and Cleaned Version")
-                st.markdown(full_output)
+                    st.markdown("### 🧠 Uploaded JSON: Full Breakdown and Cleaned Version")
+                    st.markdown(full_output)
 
-            except Exception as e:
-                st.error(f"❌ Failed to analyze JSON due to: {str(e)}")
+                except Exception as e:
+                    st.error(f"❌ Failed to analyze JSON due to: {str(e)}")
     else:
         st.info("📥 Upload a JSON file to begin analysis.")
