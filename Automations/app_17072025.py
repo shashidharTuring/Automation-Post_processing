@@ -652,25 +652,38 @@ if option == "RLHF Viewer":
 
             st.dataframe(filtered_df, use_container_width=True)
 
+            # Sticky toolbar
             st.markdown("<div class='rlhf-toolbar-sticky'></div>", unsafe_allow_html=True)
-            full_buf = io.StringIO()
-            data_csv.to_csv(full_buf, index=False)
-            filt_buf = io.StringIO()
-            filtered_df.to_csv(filt_buf, index=False)
+
+            # Create binary Excel files in memory
+            full_buf = io.BytesIO()
+            filt_buf = io.BytesIO()
+
+            # Save Excel files to buffers
+            with pd.ExcelWriter(full_buf, engine='xlsxwriter') as writer:
+                data_csv.to_excel(writer, index=False)
+            with pd.ExcelWriter(filt_buf, engine='xlsxwriter') as writer:
+                filtered_df.to_excel(writer, index=False)
+
+            # Rewind the buffer to the beginning
+            full_buf.seek(0)
+            filt_buf.seek(0)
+
+            # Download buttons
             col_dl1, col_dl2 = st.columns(2)
             with col_dl1:
                 st.download_button(
-                    label="⬇️ Download FULL CSV",
-                    data=full_buf.getvalue(),
-                    file_name="rlhf_tasks_export_full.csv",
-                    mime="text/csv",
+                    label="⬇️ Download FULL Data",
+                    data=full_buf,
+                    file_name="rlhf_tasks_export_full.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
             with col_dl2:
                 st.download_button(
-                    label="⬇️ Download FILTERED CSV",
-                    data=filt_buf.getvalue(),
-                    file_name="rlhf_tasks_export_filtered.csv",
-                    mime="text/csv",
+                    label="⬇️ Download FILTERED Data",
+                    data=filt_buf,
+                    file_name="rlhf_tasks_export_filtered.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
 
 
