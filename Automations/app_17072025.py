@@ -184,47 +184,87 @@ def compile_task_rows(
     annotator_task_df: pd.DataFrame,
 ) -> pd.DataFrame:
     compiled_rows: List[Dict[str, Any]] = []
-
+    
     for task_id, task in task_id_map.items():
-        row: Dict[str, Any] = {
+        # Base row information that's common to all turns
+        base_row: Dict[str, Any] = {
             "task_id": task_id,
             "colab_link": task.get("task", {}).get("colabLink", ""),
         }
-
+        
+        # Handle scope requirements
         scope = task.get("metadata", {}).get("scope_requirements", {})
         for k, v in scope.items():
-            row[f"scope_{k}"] = v
-
-        user_msg = next(
-            (m for m in task.get("messages", []) if m.get("role") == "user"), None
+            base_row[f"scope_{k}"] = v
+        
+        messages = task.get("messages", [])
+        
+        # Extract system message (should be first and only one)
+        system_msg = next(
+            (m for m in messages if m.get("role") == "system"), None
         )
-        assistant_msg = next(
-            (m for m in task.get("messages", []) if m.get("role") == "assistant"), None
-        )
-
-        if user_msg:
-            row["prompt"] = user_msg.get("text", "")
-            for entry in user_msg.get("prompt_evaluation", []):
-                q = entry.get("question", "").strip().replace(" ", "_").lower()
-                row[f"prompt_eval_{q}"] = entry.get("human_input_value", "")
-
-        if assistant_msg:
-            signal = assistant_msg.get("signal", {})
-            row["ideal_response"] = signal.get("ideal_response", "")
-            for eval_set in signal.get("human_evals", []):
-                for item in eval_set.get("evaluation_form", []):
-                    q = item.get("question", "").strip().replace(" ", "_").lower()
-                    row[f"assistant_eval_{q}"] = item.get("human_input_value", "")
-
-        compiled_rows.append(row)
-
+        if system_msg:
+            base_row["system_message"] = system_msg.get("text", "")
+        
+        # Get user and assistant messages in order
+        user_messages = [m for m in messages if m.get("role") == "user"]
+        assistant_messages = [m for m in messages if m.get("role") == "assistant"]
+        
+        # Create a row for each user-assistant pair
+        max_turns = max(len(user_messages), len(assistant_messages))
+        
+        for turn_idx in range(max_turns):
+            row = base_row.copy()
+            row["turn_number"] = turn_idx + 1
+            
+            # Handle user message for this turn
+            if turn_idx < len(user_messages):
+                user_msg = user_messages[turn_idx]
+                
+                # print(f"User Message (Turn {turn_idx + 1}):")
+                # print("")
+                # print(user_msg)
+                # print("_______" * 9)
+                
+                row["prompt"] = user_msg.get("text", "")
+                
+                # Handle prompt evaluation
+                for entry in user_msg.get("prompt_evaluation", []):
+                    q = entry.get("question", "").strip().replace(" ", "_").lower()
+                    row[f"prompt_eval_{q}"] = entry.get("human_input_value", "")
+            else:
+                row["prompt"] = ""
+            
+            # Handle assistant message for this turn
+            if turn_idx < len(assistant_messages):
+                assistant_msg = assistant_messages[turn_idx]
+                signal = assistant_msg.get("signal", {})
+                
+                row["ideal_response"] = signal.get("ideal_response", "")
+                
+                # Handle assistant evaluation
+                for eval_set in signal.get("human_evals", []):
+                    for item in eval_set.get("evaluation_form", []):
+                        q = item.get("question", "").strip().replace(" ", "_").lower()
+                        row[f"assistant_eval_{q}"] = item.get("human_input_value", "")
+            else:
+                row["ideal_response"] = ""
+            
+            # Add metadata about the conversation
+            row["total_user_messages"] = len(user_messages)
+            row["total_assistant_messages"] = len(assistant_messages)
+            row["total_turns"] = max_turns
+            
+            compiled_rows.append(row)
+    
     if not compiled_rows:
         return pd.DataFrame()
-
+    
     df = pd.DataFrame(compiled_rows)
     df["task_id_orig"] = df["task_id"]
     df["task_id"] = pd.to_numeric(df["task_id"], errors="coerce")
     df = df.merge(annotator_task_df, on="task_id", how="left")
+    
     return df
 
 
@@ -301,7 +341,7 @@ def row_to_record(row: pd.Series, eval_cols: List[str]) -> Dict[str, Any]:
     print("Inside row_to_record")
     meta = {col: row[col] for col in eval_cols if col in row.index}
     meta = {k: (None if pd.isna(v) else v) for k, v in meta.items()}
-
+    
     question = (
         row["prompt"] if "prompt" in row and not pd.isna(row["prompt"]) else None
     )
@@ -311,14 +351,28 @@ def row_to_record(row: pd.Series, eval_cols: List[str]) -> Dict[str, Any]:
         if "ideal_response" in row and not pd.isna(row["ideal_response"])
         else None
     )
-    return {"question": question, "answer": answer, "metadata": meta}
+    if "system_message" in eval_cols:
+        system_message = (
+        row["system_message"]
+        if "system_message" in row and not pd.isna(row["system_message"])
+        else None
+    )
+        return {"system_message": system_message, "question": question, "answer": answer, "metadata": meta}
+    else:
+        return {"question": question, "answer": answer, "metadata": meta}
 
 
+
+
+# =============================================================================
+# MODIFIED build_delivery_json_from_ingestion FUNCTION
+# =============================================================================
 def build_delivery_json_from_ingestion(
     ingestion_data: Dict[str, Any],
     data_csv: pd.DataFrame,
     data_sft: List[Dict[str, Any]],
     pdf_col: str = "scope_pdf_name",
+    min_turns: int = 3,  # New parameter for minimum turns
 ) -> Dict[str, Any]:
     if ingestion_data is None:
         return {}
@@ -351,14 +405,17 @@ def build_delivery_json_from_ingestion(
     skipped_groups = []
     Counter_1 = 0
     counter_2 = 0
+    
     for index, work_id in enumerate(work_item_ids_needed):
         if index >= len(pdf_unique):
             break
         pdf_name = pdf_unique[index]
         data_tmp = data_csv.loc[data_csv[pdf_col] == pdf_name].reset_index(drop=True)
-        Counter_1+=1
-        if data_tmp.shape[0] < 3:
-            counter_2+=1
+        Counter_1 += 1
+        
+        # Use user-defined minimum turns instead of hardcoded 3
+        if data_tmp.shape[0] < min_turns:
+            counter_2 += 1
             skipped_groups.append((pdf_name, data_tmp.shape[0]))
             continue
 
@@ -402,17 +459,20 @@ def build_delivery_json_from_ingestion(
         }
         master_list.append(tmp_dict)
 
+    # Show skipped groups info with user-defined minimum
     if skipped_groups:
-        # st.warning(
-        #     "Skipped groups (rows != 3): "
-        #     + ", ".join([f"{name}({n})" for name, n in skipped_groups])
-        # )
-        pass
+        st.warning(
+            f"Skipped {len(skipped_groups)} groups with fewer than {min_turns} turns: "
+            + ", ".join([f"{name}({n})" for name, n in skipped_groups[:5]])  # Show first 5
+            + ("..." if len(skipped_groups) > 5 else "")
+        )
 
     return {
         "fileMetadata": ingestion_data.get("fileMetadata"),
         "workitems": master_list,
     }
+
+
 
 
 # =============================================================================
@@ -708,12 +768,49 @@ if option == "RLHF Viewer":
             st.info("Upload an ingestion JSON to enable batch creation.")
         else:
             st.success("Ingestion JSON loaded.")
+            
+            # Add the two user input controls
+            st.markdown("### ⚙️ Configuration Settings")
+            
+            # Create two columns for the inputs
+            config_col1, config_col2 = st.columns(2)
+            
+            with config_col1:
+                # 1. Turns associated dropdown (1-10)
+                min_turns_required = st.selectbox(
+                    "Minimum Turns Required",
+                    options=list(range(1, 11)),
+                    index=2,  # Default to 3 (index 2 in 1-10 range)
+                    help="Groups with fewer than this number of turns will be skipped",
+                    key="min_turns_select"
+                )
+            
+            with config_col2:
+                # 2. PDF identifier field dropdown
+                available_columns = data_csv.columns.tolist()
+                
+                # Set default to scope_pdf_name if it exists, otherwise first column
+                default_pdf_col = "scope_pdf_name" if "scope_pdf_name" in available_columns else available_columns[0]
+                default_index = available_columns.index(default_pdf_col) if default_pdf_col in available_columns else 0
+                
+                pdf_identifier_field = st.selectbox(
+                    "PDF Identifier Field",
+                    options=available_columns,
+                    index=default_index,
+                    help="Column used to group turns for delivery batch creation",
+                    key="pdf_identifier_select"
+                )
 
+            # Show current configuration
+            st.info(f"📊 Current Config: Min turns = {min_turns_required}, Grouping field = '{pdf_identifier_field}'")
+
+            # Modified function call with user inputs
             final_json_dict = build_delivery_json_from_ingestion(
                 ingestion_data=ingestion_data,
                 data_csv=data_csv,
                 data_sft=data_sft,
-                pdf_col="scope_pdf_name",
+                pdf_col=pdf_identifier_field,  # Use user-selected column
+                min_turns=min_turns_required   # Pass minimum turns parameter
             )
 
             if final_json_dict:
@@ -763,6 +860,7 @@ if option == "RLHF Viewer":
                 )
             else:
                 st.warning("No delivery batch could be built (see warnings/errors above).")
+
 
 
     # =============================================================================
