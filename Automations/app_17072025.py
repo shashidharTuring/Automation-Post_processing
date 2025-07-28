@@ -5,6 +5,7 @@ import numpy as np
 import io
 import uuid
 from datetime import datetime, timezone
+from jsonschema import Draft7Validator, ValidationError
 from typing import Any, Dict, List, Optional
 import os
 from dotenv import load_dotenv
@@ -128,10 +129,12 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 st.title("🔍 Choose Viewer Mode")
 option = st.radio(
     label="Select a Viewer",
-    options=["Home", "RLHF Viewer", "JSON Visualizer"],
+    # ⬅️  add “Schema Validator” here
+    options=["Home", "RLHF Viewer", "JSON Visualizer", "Schema Validator"],
     index=0,
     horizontal=True
 )
+
 
 
 
@@ -556,8 +559,7 @@ if option == "RLHF Viewer":
         [
             "🔍 Inspect Task ID",
             "🧾 View CSV",
-            "📦 Delivery Batch Creator",
-            "✅ Validator (placeholder)"
+            "📦 Delivery Batch Creator"
         ]
     )
     
@@ -863,27 +865,7 @@ if option == "RLHF Viewer":
 
 
 
-    # =============================================================================
-    # TAB 4 – VALIDATOR (placeholder)
-    # =============================================================================
-    with validator_tab:
-        st.subheader("Validator – Coming Soon")
-        st.caption("Upload an output schema file for future validation (no logic yet).")
-        st.markdown(
-            "<div class='rlhf-dropzone'>Drop a schema file below (JSON, CSV, XLSX, YAML). Validation not yet implemented.</div>",
-            unsafe_allow_html=True,
-        )
 
-        validator_file = st.file_uploader(
-            "Upload Output Schema File",
-            type=["json", "csv", "xlsx", "yaml", "yml"],
-            key="validator_schema_uploader",
-        )
-
-        if validator_file is not None:
-            st.info("File received. Validation logic not yet implemented.")
-        else:
-            st.write("No schema uploaded yet.")
 
 
 # =============================================================================
@@ -973,3 +955,86 @@ Prepare a table with the following columns:
                     st.error(f"❌ Failed to analyze JSON due to: {str(e)}")
     else:
         st.info("📥 Upload a JSON file to begin analysis.")
+
+# =============================================================================
+# SCHEMA VALIDATOR  (stand-alone page)
+# =============================================================================
+elif option == "Schema Validator":
+    st.title("📐 Delivery-JSON Schema Validator")
+
+    st.markdown(
+        "Upload the final *delivery batch* JSON **and** a corresponding **Draft-7 schema** "
+        "to check structural compliance."
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("#### 📤 Delivery JSON")
+        delivery_file = st.file_uploader("Upload delivery.json", type="json", key="validator_delivery")
+    with col2:
+        st.markdown("#### 📤 Schema JSON")
+        schema_file   = st.file_uploader("Upload schema.json",   type="json", key="validator_schema")
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Shared helper (moved from old tab)
+    # ─────────────────────────────────────────────────────────────────────────────
+    from jsonschema import Draft7Validator, ValidationError
+
+    def _format_err(err: ValidationError, item_idx: int, wi: str) -> dict:
+        path = " → ".join(map(str, err.path))
+        if err.validator == "required":
+            brief = f"Missing field(s): {', '.join(err.schema['required'])}"
+        elif err.validator == "maxItems":
+            brief = f"Too many items – max {err.validator_value}"
+        elif err.validator == "type":
+            brief = f"Invalid type – expected {err.validator_value}"
+        elif err.validator == "pattern":
+            brief = f"Pattern mismatch – {err.validator_value}"
+        elif err.validator == "oneOf":
+            brief = f"Unsupported value – must match one schema in oneOf"
+        else:
+            brief = err.message
+        return {
+            "workItemId": wi,
+            "item_index": item_idx,
+            "error_path": path,
+            "brief_message": brief,
+            "validator": err.validator,
+            "raw_message": err.message,
+        }
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Validation logic
+    # ─────────────────────────────────────────────────────────────────────────────
+    if delivery_file and schema_file:
+        delivery  = load_json(delivery_file)
+        schema    = load_json(schema_file)
+
+        if not delivery or not schema:
+            st.error("❌ Failed to read one of the files.")
+            st.stop()
+
+        if "workitems" not in delivery or not isinstance(delivery["workitems"], list):
+            st.error("❌ `'workitems'` key missing or not a list in delivery JSON.")
+            st.stop()
+
+        validator  = Draft7Validator(schema)
+        errors_out = []
+
+        for idx, wi in enumerate(delivery["workitems"]):
+            wid = wi.get("workItemId", f"INDEX_{idx}")
+            for err in validator.iter_errors(wi):
+                errors_out.append(_format_err(err, idx, wid))
+
+        if errors_out:
+            st.error(f"❌ Found {len(errors_out)} schema error(s).")
+            err_df = pd.DataFrame(errors_out)
+            st.dataframe(err_df, use_container_width=True)
+        else:
+            st.success("✅ Validation Successful — all workitems conform to the schema!")
+
+    elif delivery_file or schema_file:
+        st.warning("⚠️  Please upload **both** files to run the validator.")
+    else:
+        st.info("📥 Awaiting uploads…")
+
