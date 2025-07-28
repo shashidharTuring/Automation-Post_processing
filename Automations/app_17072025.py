@@ -555,7 +555,7 @@ if option == "RLHF Viewer":
             unsafe_allow_html=True,
         )
 
-    inspect_tab, csv_tab, delivery_tab, validator_tab = st.tabs(
+    inspect_tab, csv_tab, delivery_tab = st.tabs(
         [
             "🔍 Inspect Task ID",
             "🧾 View CSV",
