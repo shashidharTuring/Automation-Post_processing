@@ -3,6 +3,7 @@ import json
 import pandas as pd
 import numpy as np
 import io
+import re
 import uuid
 from datetime import datetime, timezone
 from jsonschema import Draft7Validator, ValidationError
@@ -135,6 +136,42 @@ option = st.radio(
     horizontal=True
 )
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def _clean_col(name: str) -> str:
+    """
+    Make a safe Excel/CSV column name but keep the original wording.
+    Removes characters Excel dislikes (\, /, [, ], :, * ?, newline) and trims.
+    """
+    name = re.sub(r"[\\/\[\]:*?\n\r]", " ", name).strip()
+    return re.sub(r"\s{2,}", " ", name)          # collapse runs of spaces
+
+
+def _add_extra_msg_keys(target: dict, msg: dict, role_prefix: str) -> None:
+    """
+    Copy *all* keys (except role/text/signal/prompt_evaluation) from a message
+    into the row-dict, prefixing them with user_ / assistant_.
+    """
+    EXCLUDE = {"role", "text", "signal", "prompt_evaluation"}
+    for k, v in msg.items():
+        if k in EXCLUDE:
+            continue
+        target[f"{role_prefix}_{k}"] = v
+
+def _jsonify(val):
+    """Excel hates raw dict / list objects.  Convert them to compact JSON."""
+    if isinstance(val, (dict, list)):
+        return json.dumps(val, ensure_ascii=False)
+    return val
+
+
+# ── helper: copy *extra* user-side keys (e.g. images_list) into the row ──────
+def _add_user_extras(dst: dict, msg: dict) -> None:
+    for k, v in msg.items():
+        if k in {"role", "text", "prompt_evaluation"}:
+            continue
+        dst[f"user_{k}"] = _jsonify(v)
 
 
 
@@ -186,90 +223,83 @@ def compile_task_rows(
     data_sft: List[Dict[str, Any]],
     annotator_task_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    compiled_rows: List[Dict[str, Any]] = []
-    
-    for task_id, task in task_id_map.items():
-        # Base row information that's common to all turns
-        base_row: Dict[str, Any] = {
-            "task_id": task_id,
-            "colab_link": task.get("task", {}).get("colabLink", ""),
-        }
-        
-        # Handle scope requirements
-        scope = task.get("metadata", {}).get("scope_requirements", {})
-        for k, v in scope.items():
-            base_row[f"scope_{k}"] = v
-        
-        messages = task.get("messages", [])
-        
-        # Extract system message (should be first and only one)
-        system_msg = next(
-            (m for m in messages if m.get("role") == "system"), None
-        )
-        if system_msg:
-            base_row["system_message"] = system_msg.get("text", "")
-        
-        # Get user and assistant messages in order
-        user_messages = [m for m in messages if m.get("role") == "user"]
-        assistant_messages = [m for m in messages if m.get("role") == "assistant"]
-        
-        # Create a row for each user-assistant pair
-        max_turns = max(len(user_messages), len(assistant_messages))
-        
-        for turn_idx in range(max_turns):
-            row = base_row.copy()
-            row["turn_number"] = turn_idx + 1
-            
-            # Handle user message for this turn
-            if turn_idx < len(user_messages):
-                user_msg = user_messages[turn_idx]
-                
-                # print(f"User Message (Turn {turn_idx + 1}):")
-                # print("")
-                # print(user_msg)
-                # print("_______" * 9)
-                
-                row["prompt"] = user_msg.get("text", "")
-                
-                # Handle prompt evaluation
-                for entry in user_msg.get("prompt_evaluation", []):
-                    q = entry.get("question", "").strip().replace(" ", "_").lower()
-                    row[f"prompt_eval_{q}"] = entry.get("human_input_value", "")
-            else:
-                row["prompt"] = ""
-            
-            # Handle assistant message for this turn
-            if turn_idx < len(assistant_messages):
-                assistant_msg = assistant_messages[turn_idx]
-                signal = assistant_msg.get("signal", {})
-                
-                row["ideal_response"] = signal.get("ideal_response", "")
-                
-                # Handle assistant evaluation
-                for eval_set in signal.get("human_evals", []):
-                    for item in eval_set.get("evaluation_form", []):
-                        q = item.get("question", "").strip().replace(" ", "_").lower()
-                        row[f"assistant_eval_{q}"] = item.get("human_input_value", "")
-            else:
-                row["ideal_response"] = ""
-            
-            # Add metadata about the conversation
-            row["total_user_messages"] = len(user_messages)
-            row["total_assistant_messages"] = len(assistant_messages)
-            row["total_turns"] = max_turns
-            
-            compiled_rows.append(row)
-    
-    if not compiled_rows:
-        return pd.DataFrame()
-    
-    df = pd.DataFrame(compiled_rows)
-    df["task_id_orig"] = df["task_id"]
-    df["task_id"] = pd.to_numeric(df["task_id"], errors="coerce")
-    df = df.merge(annotator_task_df, on="task_id", how="left")
-    
-    return df
 
+    rows: list[dict] = []
+
+    for task_id, task in task_id_map.items():
+        base = {"task_id": task_id,
+                "colab_link": task.get("task", {}).get("colabLink", "")}
+
+        # scope_*
+        for k, v in task.get("metadata", {}).get("scope_requirements", {}).items():
+            base[f"scope_{k}"] = v
+
+        # system msg (if any)
+        sys = next((m for m in task.get("messages", []) if m.get("role") == "system"), None)
+        if sys:
+            base["system_message"] = sys.get("text", "")
+
+        users       = [m for m in task.get("messages", []) if m.get("role") == "user"]
+        assistants  = [m for m in task.get("messages", []) if m.get("role") == "assistant"]
+        n_turns     = max(len(users), len(assistants))
+
+        # ── iterate over turns ────────────────────────────────────────────────
+        for idx in range(n_turns):
+            r = base.copy()
+            r["turn_number"] = idx + 1
+
+            # USER  ───────────────────────────────────────────────────────────
+            if idx < len(users):
+                u = users[idx]
+                r["prompt"] = u.get("text", "")
+
+                # prompt evaluations  (one col / question)
+                for pe in u.get("prompt_evaluation", []):
+                    col = _clean_col(pe.get("question", ""))
+                    r[col] = pe.get("human_input_value", "")
+                # any other keys (e.g. images_list)
+                _add_user_extras(r, u)
+            else:
+                r["prompt"] = ""
+
+            # ASSISTANT  ──────────────────────────────────────────────────────
+            if idx < len(assistants):
+                a       = assistants[idx]
+                signal  = a.get("signal", {})
+
+                # model_response (text from response_options[0].text)
+                opts = a.get("response_options", [])
+                if opts and isinstance(opts, list):
+                    r["model_response"] = opts[0].get("text", "")
+                else:
+                    r["model_response"] = ""
+
+                # ideal_response (keep column – still useful)
+                r["ideal_response"] = signal.get("ideal_response", "")
+
+                # human evals  (one col / question)
+                for he_set in signal.get("human_evals", []):
+                    for item in he_set.get("evaluation_form", []):
+                        col = _clean_col(item.get("question", ""))
+                        r[col] = item.get("human_input_value", "")
+            else:
+                r["model_response"] = ""
+                r["ideal_response"] = ""
+
+            # meta counts
+            r["total_user_messages"]      = len(users)
+            r["total_assistant_messages"] = len(assistants)
+            r["total_turns"]              = n_turns
+
+            rows.append(r)
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    df["task_id_orig"] = df["task_id"]
+    df["task_id"]      = pd.to_numeric(df["task_id"], errors="coerce")
+    return df.merge(annotator_task_df, on="task_id", how="left")
 
 def _safe_show_eval_rows(rows: List[Dict[str, Any]]):
     df = pd.DataFrame(rows)
@@ -878,6 +908,7 @@ elif option == "JSON Visualizer":
     json_file = st.file_uploader("Upload JSON File", type="json", key="visualizer_json_uploader")
 
     if json_file:
+        
         load_dotenv()
         OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
         if not OPENAI_API_KEY:
