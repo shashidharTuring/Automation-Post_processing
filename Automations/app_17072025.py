@@ -139,6 +139,50 @@ option = st.radio(
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
+import re, itertools
+
+_UUID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.I,
+)
+
+def extract_uuid_inner_keys(fmt_json: dict) -> list[str]:
+    """
+    Return EVERY raw key that occurs *inside* any UUID-named field under
+    fmt_json["workitems"][0]  (recursively, at any depth).
+
+    Example output for your sample:  id, topic, sub_type, question, options,
+    answer_model, answer_detailed, nova_premier, critique, summary, details,
+    answer, data, metadata, taskAnswers, operationType, labelledTimestamp,
+    obfuscatedDaAlias, etc.
+    """
+    keys: set[str] = set()
+
+    def walk(obj: Any) -> None:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                keys.add(k)
+                walk(v)
+        elif isinstance(obj, list) and obj:
+            walk(obj[0])           # take structure of first element
+
+    # find workitems[0] safely ------------------------------------------------
+    try:
+        wi0 = fmt_json["workitems"][0]
+    except Exception:
+        return []
+
+    # iterate UUID buckets only ----------------------------------------------
+    for k, v in wi0.items():
+        if _UUID.match(k):         # only process UUID-looking keys
+            if isinstance(v, list) and v:
+                walk(v[0])         # the list's first item shows the schema
+
+    return sorted(keys)
+
+
+
+
 def _clean_col(name: str) -> str:
     """
     Make a safe Excel/CSV column name but keep the original wording.
@@ -393,6 +437,27 @@ def row_to_record(row: pd.Series, eval_cols: List[str]) -> Dict[str, Any]:
         return {"system_message": system_message, "question": question, "answer": answer, "metadata": meta}
     else:
         return {"question": question, "answer": answer, "metadata": meta}
+    
+def extract_leaf_paths(workitem: dict, sep=".") -> list[str]:
+    """
+    Recursively return the dotted path for *every leaf value* inside workitem.
+
+    Example path: "a2072a5f-3e48-... .0.data.taskAnswers.0.critique.details"
+    """
+    paths = []
+
+    def walk(node, prefix=""):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                walk(v, f"{prefix}{sep}{k}" if prefix else k)
+        elif isinstance(node, list) and node:
+            walk(node[0], f"{prefix}{sep}0" if prefix else "0")
+        else:
+            paths.append(prefix)   # reached a scalar → leaf key
+
+    walk(workitem)
+    return sorted(paths)
+
 
 
 
@@ -585,14 +650,12 @@ if option == "RLHF Viewer":
             unsafe_allow_html=True,
         )
 
-    inspect_tab, csv_tab, delivery_tab = st.tabs(
-        [
-            "🔍 Inspect Task ID",
-            "🧾 View CSV",
-            "📦 Delivery Batch Creator"
-        ]
-    )
-    
+    inspect_tab, csv_tab, delivery_tab, custom_tab = st.tabs(
+    ["🔍 Inspect Task ID",
+     "🧾 View CSV",
+     "📦 Delivery Batch Creator",
+     "🗂️ Custom Deliverable"]          # NEW
+)
 
 
     # =============================================================================
@@ -893,8 +956,97 @@ if option == "RLHF Viewer":
             else:
                 st.warning("No delivery batch could be built (see warnings/errors above).")
 
+    # =============================================================================
+    # TAB 4 – CUSTOM DELIVERABLE
+    # =============================================================================
 
+    custom_tab = st.tabs(["Custom Deliverable"])[0]
+    with custom_tab:
+        st.subheader("Custom Deliverable Builder")
 
+        fmt_file = st.file_uploader("Upload Output‑Format JSON", type="json", key="fmt")
+        fmt_json = load_json(fmt_file) if fmt_file else None
+        if not fmt_json: st.info("Upload an output‑format JSON."); st.stop()
+
+        try:
+            wi0 = fmt_json["workitems"][0]
+        except Exception:
+            st.error("Couldn’t find workitems[0]"); st.stop()
+
+        if data_csv.empty:
+            st.warning("CSV table is empty – upload RLHF JSON first."); st.stop()
+
+        # ---- collect leaf paths that currently hold scalar / non‑empty list --
+        leaves = []
+        def walk(node, p=""):
+            if isinstance(node, dict):
+                for k,v in node.items(): walk(v, f"{p}.{k}" if p else k)
+            elif isinstance(node, list):
+                if node and all(not isinstance(e,(dict,list)) for e in node) and any(e not in ("",None) for e in node):
+                    leaves.append(p)
+                else:
+                    for i,e in enumerate(node): walk(e, f"{p}.{i}" if p else str(i))
+            else:
+                if node not in ("",None): leaves.append(p)
+        walk(wi0); leaves=sorted(set(leaves))
+
+        # ---- mapping table (version‑agnostic) -------------------------------
+        csv_cols    = ["〈NULL〉"] + sorted(data_csv.columns)
+        mapping     = st.session_state.setdefault("custom_mapping", {})
+        tbl_df      = pd.DataFrame({"key":leaves,
+                                    "csv_column":[mapping.get(k,"〈NULL〉") for k in leaves]})
+
+        # use SelectboxColumn if available
+        SelectboxCol = getattr(st.column_config, "SelectboxColumn", None)
+        col_cfg = {
+            "key": st.column_config.Column(disabled=True),
+            "csv_column": SelectboxCol("Map to CSV", options=csv_cols) if SelectboxCol
+                          else st.column_config.Column("Map to CSV (type)", width="medium")
+        }
+
+        edited = st.data_editor(tbl_df, column_config=col_cfg, hide_index=True,
+                                use_container_width=True)
+        mapping.update({k:v for k,v in edited.values if v in csv_cols})
+
+        # ---- build placeholder skeleton ------------------------------------
+        def fill(node, p=""):
+            if isinstance(node, dict):
+                return {k: fill(v, f"{p}.{k}" if p else k) for k, v in node.items()}
+
+            elif isinstance(node, list):
+                if not node:
+                    return []                                     # empty list → keep as is
+
+                # list of scalars → single placeholder per element
+                if all(not isinstance(e, (dict, list)) for e in node):
+                    m = mapping.get(p, "〈NULL〉")
+                    placeholder = f"{{{{{m}}}}}" if m != "〈NULL〉" else None
+                    return [placeholder if placeholder else e for e in node]
+
+                # list of objects → recurse *each* element (no shortcuts)
+                filled = []
+                for idx, elem in enumerate(node):
+                    filled.append(fill(elem, f"{p}.{idx}" if p else str(idx)))
+                return filled
+
+            else:  # scalar
+                m = mapping.get(p, "〈NULL〉")
+                return f"{{{{{m}}}}}" if m != "〈NULL〉" else node
+
+        skeleton = dict(fmt_json)
+        skeleton["workitems"][0] = fill(wi0)
+
+        # ---- two‑pane layout ------------------------------------------------
+        left,right = st.columns([1.2,1])
+        with left:
+            st.markdown("#### 📄 Live Skeleton")
+            st.json(skeleton, expanded=False)
+            st.download_button("💾 Download skeleton JSON",
+                               data=json.dumps(skeleton,indent=2).encode(),
+                               file_name="deliverable_placeholder.json",
+                               mime="application/json")
+        with right:
+            st.success("Mapping updated 👍")
 
 
 
