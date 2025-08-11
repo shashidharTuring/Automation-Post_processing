@@ -9,8 +9,10 @@ from datetime import datetime, timezone
 from jsonschema import Draft7Validator, ValidationError
 from typing import Any, Dict, List, Optional
 import os
+import copy
 from dotenv import load_dotenv
 import openai
+import json, io, zipfile, copy
 
 # =============================================================================
 # CUSTOM CSS (responsive width + visual polish)
@@ -612,6 +614,7 @@ if option == "RLHF Viewer":
         st.stop()
 
     data_csv = compile_task_rows(task_id_map, data_sft, annotator_task_df)
+    st.session_state["data_csv"] = data_csv
 
 
     # =============================================================================
@@ -960,93 +963,181 @@ if option == "RLHF Viewer":
     # TAB 4 – CUSTOM DELIVERABLE
     # =============================================================================
 
-    custom_tab = st.tabs(["Custom Deliverable"])[0]
-    with custom_tab:
-        st.subheader("Custom Deliverable Builder")
-
-        fmt_file = st.file_uploader("Upload Output‑Format JSON", type="json", key="fmt")
-        fmt_json = load_json(fmt_file) if fmt_file else None
-        if not fmt_json: st.info("Upload an output‑format JSON."); st.stop()
-
+    def _load_json(u):
+        if u is None:
+            return None
         try:
-            wi0 = fmt_json["workitems"][0]
+            return json.load(u)
+        except Exception as e:
+            st.error(f"❌ Failed to read JSON – {e}")
+            return None
+
+
+    def _default_for(jtype: str):
+        return {
+            "object": {},
+            "array":  [],
+            "integer": 0,
+            "number":  0.0,
+            "boolean": False,
+            "string":  ""
+        }.get(jtype, "")
+
+
+    def _coerce(val: Any, jtype: str):
+        import pandas as _pd
+        if _pd.isna(val) or val in ("", None):
+            return _default_for(jtype)
+        try:
+            if jtype == "string":
+                return str(val)
+            if jtype == "integer":
+                return int(float(val))
+            if jtype == "number":
+                return float(val)
+            if jtype == "boolean":
+                if isinstance(val, bool):
+                    return val
+                return str(val).strip().lower() in ("true", "1", "yes")
+            if jtype == "array":
+                if isinstance(val, (list, dict)):
+                    return val
+                return [v.strip() for v in str(val).split(",") if v.strip()]
+            if jtype == "object":
+                if isinstance(val, (dict, list)):
+                    return val
+                try:
+                    return json.loads(val)
+                except Exception:
+                    return {}
         except Exception:
-            st.error("Couldn’t find workitems[0]"); st.stop()
+            return _default_for(jtype)
+        return val
 
-        if data_csv.empty:
-            st.warning("CSV table is empty – upload RLHF JSON first."); st.stop()
 
-        # ---- collect leaf paths that currently hold scalar / non‑empty list --
-        leaves = []
-        def walk(node, p=""):
-            if isinstance(node, dict):
-                for k,v in node.items(): walk(v, f"{p}.{k}" if p else k)
-            elif isinstance(node, list):
-                if node and all(not isinstance(e,(dict,list)) for e in node) and any(e not in ("",None) for e in node):
-                    leaves.append(p)
+    def gather_schema_leaves(node: Any, p: str = "", bag=None, tmap=None):
+        if bag is None:
+            bag = set()
+        if tmap is None:
+            tmap = {}
+        if isinstance(node, list):
+            for sub in node:
+                gather_schema_leaves(sub, f"{p}.0" if p else "0", bag, tmap)
+            return sorted(bag), tmap
+        if not isinstance(node, dict):
+            bag.add(p)
+            return sorted(bag), tmap
+        for comb in ("oneOf", "anyOf", "allOf"):
+            if comb in node:
+                for sub in node[comb]:
+                    gather_schema_leaves(sub, p, bag, tmap)
+        if node.get("type") == "object" and "properties" in node:
+            for k, v in node["properties"].items():
+                gather_schema_leaves(v, f"{p}.{k}" if p else k, bag, tmap)
+            return sorted(bag), tmap
+        if node.get("type") == "array" and "items" in node:
+            subs = node["items"] if isinstance(node["items"], list) else [node["items"]]
+            for sub in subs:
+                gather_schema_leaves(sub, f"{p}.0" if p else "0", bag, tmap)
+            return sorted(bag), tmap
+        bag.add(p)
+        jtype = node.get("type", "string")
+        tmap[p] = jtype if isinstance(jtype, str) else jtype[0]
+        return sorted(bag), tmap
+
+
+    def set_by_path(root: Any, path: str, value: Any):
+        parts = path.split("."); cur = root
+        for i, tok in enumerate(parts):
+            last, is_idx = i == len(parts) - 1, tok.isdigit()
+            key = int(tok) if is_idx else tok
+            if last:
+                if is_idx:
+                    while len(cur) <= key: cur.append(None)
+                    cur[key] = value
                 else:
-                    for i,e in enumerate(node): walk(e, f"{p}.{i}" if p else str(i))
+                    cur[key] = value
+                return
+            want_blank = [] if parts[i + 1].isdigit() else {}
+            if is_idx:
+                while len(cur) <= key: cur.append(copy.deepcopy(want_blank))
+                if not isinstance(cur[key], (list, dict)):
+                    cur[key] = copy.deepcopy(want_blank)
+                cur = cur[key]
             else:
-                if node not in ("",None): leaves.append(p)
-        walk(wi0); leaves=sorted(set(leaves))
+                if key not in cur or not isinstance(cur[key], (list, dict)):
+                    cur[key] = copy.deepcopy(want_blank)
+                cur = cur[key]
 
-        # ---- mapping table (version‑agnostic) -------------------------------
-        csv_cols    = ["〈NULL〉"] + sorted(data_csv.columns)
-        mapping     = st.session_state.setdefault("custom_mapping", {})
-        tbl_df      = pd.DataFrame({"key":leaves,
-                                    "csv_column":[mapping.get(k,"〈NULL〉") for k in leaves]})
+    with custom_tab:
+        st.header("🗂️ Custom Deliverable Builder")
 
-        # use SelectboxColumn if available
-        SelectboxCol = getattr(st.column_config, "SelectboxColumn", None)
-        col_cfg = {
+       
+
+        schema_file = st.file_uploader("📄 Upload Output-Schema JSON", type="json")
+        schema_json = _load_json(schema_file)
+        if schema_json is None:
+            st.info("Upload a schema to start."); st.stop()
+
+        data_csv: pd.DataFrame = st.session_state.get("data_csv", pd.DataFrame())
+        if data_csv.empty:
+            st.error("CSV empty – load RLHF Viewer first."); st.stop()
+
+        leaves, typemap = gather_schema_leaves(schema_json)
+
+        csv_cols = [""] + sorted(data_csv.columns)          # "" means unmapped
+        mapping  = st.session_state.setdefault("schema_mapping", {})
+        tbl_df   = pd.DataFrame(
+            {"key": leaves, "csv_column": [mapping.get(k, "") for k in leaves]}
+        )
+
+        Selectbox = getattr(st.column_config, "SelectboxColumn", None)
+        col_cfg   = {
             "key": st.column_config.Column(disabled=True),
-            "csv_column": SelectboxCol("Map to CSV", options=csv_cols) if SelectboxCol
-                          else st.column_config.Column("Map to CSV (type)", width="medium")
+            "csv_column": (
+                Selectbox("Map to CSV (blank = unmapped)", options=csv_cols)
+                if Selectbox else
+                st.column_config.Column("Map to CSV", width="medium")
+            ),
         }
+        edited = st.data_editor(tbl_df, column_config=col_cfg,
+                                hide_index=True, use_container_width=True)
 
-        edited = st.data_editor(tbl_df, column_config=col_cfg, hide_index=True,
-                                use_container_width=True)
-        mapping.update({k:v for k,v in edited.values if v in csv_cols})
+        for k, v in edited.itertuples(index=False):
+            mapping[k] = v  # may be ""
 
-        # ---- build placeholder skeleton ------------------------------------
-        def fill(node, p=""):
-            if isinstance(node, dict):
-                return {k: fill(v, f"{p}.{k}" if p else k) for k, v in node.items()}
+        # build template skeleton (show default values)
+        skeleton: Dict[str, Any] = {}
+        for p in leaves:
+            default_val = _default_for(typemap.get(p, "string"))
+            set_by_path(skeleton, p, f"{{{{{mapping[p]}}}}}" if mapping[p] else default_val)
 
-            elif isinstance(node, list):
-                if not node:
-                    return []                                     # empty list → keep as is
+        st.markdown("#### 📄 Skeleton Template")
+        st.json(skeleton, expanded=False)
 
-                # list of scalars → single placeholder per element
-                if all(not isinstance(e, (dict, list)) for e in node):
-                    m = mapping.get(p, "〈NULL〉")
-                    placeholder = f"{{{{{m}}}}}" if m != "〈NULL〉" else None
-                    return [placeholder if placeholder else e for e in node]
+        # ─── Generate deliverables.json ─────────────────────────────────────────
+        if st.button("⚙️ Generate deliverables.json"):
+            filled_list = []
+            for _, row in data_csv.iterrows():
+                filled = copy.deepcopy(skeleton)
+                row_dict = row.to_dict()
+                for p in leaves:
+                    col   = mapping.get(p, "")
+                    jtype = typemap.get(p, "string")
+                    raw   = row_dict.get(col, "") if col else ""
+                    val   = _coerce(raw, jtype)
+                    set_by_path(filled, p, val)
+                filled_list.append(filled)
 
-                # list of objects → recurse *each* element (no shortcuts)
-                filled = []
-                for idx, elem in enumerate(node):
-                    filled.append(fill(elem, f"{p}.{idx}" if p else str(idx)))
-                return filled
+            payload = json.dumps(filled_list, ensure_ascii=False, indent=2).encode()
+            st.download_button("⬇️ Download deliverables.json",
+                            data=payload,
+                            file_name="deliverables.json",
+                            mime="application/json")
 
-            else:  # scalar
-                m = mapping.get(p, "〈NULL〉")
-                return f"{{{{{m}}}}}" if m != "〈NULL〉" else node
-
-        skeleton = dict(fmt_json)
-        skeleton["workitems"][0] = fill(wi0)
-
-        # ---- two‑pane layout ------------------------------------------------
-        left,right = st.columns([1.2,1])
-        with left:
-            st.markdown("#### 📄 Live Skeleton")
-            st.json(skeleton, expanded=False)
-            st.download_button("💾 Download skeleton JSON",
-                               data=json.dumps(skeleton,indent=2).encode(),
-                               file_name="deliverable_placeholder.json",
-                               mime="application/json")
-        with right:
-            st.success("Mapping updated 👍")
+            if filled_list:
+                st.markdown("#### 🔍 Preview of first generated dict")
+                st.json(filled_list[0], expanded=False)
 
 
 
