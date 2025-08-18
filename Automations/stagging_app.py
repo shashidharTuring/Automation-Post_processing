@@ -2473,46 +2473,78 @@ class CustomDeliverableBuilder:
         bag: Optional[Set[str]] = None, 
         tmap: Optional[Dict[str, str]] = None
     ) -> Tuple[List[str], Dict[str, str]]:
-        """Recursively gather all leaf paths from JSON schema"""
+        """
+        Robust schema leaf extraction:
+        - Walks properties/items
+        - Unions across oneOf/anyOf/allOf
+        - Treats plain typed nodes ("type": "object"/"array"/"string"/...) as leaves
+        - Handles items as object or list of alternatives
+        - Never adds bogus leaves from unknown dicts
+        """
         if bag is None:
             bag = set()
         if tmap is None:
             tmap = {}
-            
-        if isinstance(node, list):
+
+        def _record_leaf(p: str, t: Union[str, List[str], None]):
+            if not p:
+                return
+            jt = "string"
+            if isinstance(t, str):
+                jt = t
+            elif isinstance(t, list) and t:
+                jt = t[0]
+            elif t is None:
+                jt = "string"
+            bag.add(p)
+            tmap[p] = jt
+
+        if isinstance(node, dict):
+            # Alternatives
+            for comb in ("oneOf", "anyOf", "allOf"):
+                if comb in node and isinstance(node[comb], list):
+                    for sub in node[comb]:
+                        CustomDeliverableBuilder.gather_schema_leaves(sub, path, bag, tmap)
+                    return sorted(bag), tmap
+
+            # Object with properties
+            if "properties" in node and isinstance(node["properties"], dict):
+                for k, v in node["properties"].items():
+                    new_path = f"{path}.{k}" if path else k
+                    CustomDeliverableBuilder.gather_schema_leaves(v, new_path, bag, tmap)
+                return sorted(bag), tmap
+
+            # Array with items
+            if "items" in node:
+                items = node["items"]
+                if isinstance(items, list):
+                    for sub in items:
+                        CustomDeliverableBuilder.gather_schema_leaves(
+                            sub, f"{path}.0" if path else "0", bag, tmap
+                        )
+                else:
+                    CustomDeliverableBuilder.gather_schema_leaves(
+                        items, f"{path}.0" if path else "0", bag, tmap
+                    )
+                return sorted(bag), tmap
+
+            # Simple typed leaf (object/array/string/number/integer/boolean)
+            if "type" in node:
+                _record_leaf(path, node.get("type"))
+                return sorted(bag), tmap
+
+            # Unknown dict shape → ignore
+            return sorted(bag), tmap
+
+        elif isinstance(node, list):
+            # Walk every alternative
             for sub in node:
                 CustomDeliverableBuilder.gather_schema_leaves(
                     sub, f"{path}.0" if path else "0", bag, tmap
                 )
             return sorted(bag), tmap
-            
-        if not isinstance(node, dict):
-            bag.add(path)
-            return sorted(bag), tmap
-            
-        for comb in ("oneOf", "anyOf", "allOf"):
-            if comb in node:
-                for sub in node[comb]:
-                    CustomDeliverableBuilder.gather_schema_leaves(sub, path, bag, tmap)
-                    
-        if node.get("type") == "object" and "properties" in node:
-            for k, v in node["properties"].items():
-                CustomDeliverableBuilder.gather_schema_leaves(
-                    v, f"{path}.{k}" if path else k, bag, tmap
-                )
-            return sorted(bag), tmap
-            
-        if node.get("type") == "array" and "items" in node:
-            subs = node["items"] if isinstance(node["items"], list) else [node["items"]]
-            for sub in subs:
-                CustomDeliverableBuilder.gather_schema_leaves(
-                    sub, f"{path}.0" if path else "0", bag, tmap
-                )
-            return sorted(bag), tmap
-            
-        bag.add(path)
-        jtype = node.get("type", "string")
-        tmap[path] = jtype if isinstance(jtype, str) else jtype[0]
+
+        # Non-dict/list nodes → ignore
         return sorted(bag), tmap
 
     @staticmethod
@@ -2603,7 +2635,7 @@ class CustomDeliverableBuilder:
         all_df: pd.DataFrame,
         typemap: Dict[str, str]
     ) -> Any:
-        """Generate concrete value for custom deliverable field"""
+        """Generate concrete value for custom deliverable field with min group size check"""
         if kind == "schema":
             col = cfg.get("col", "")
             if not col:
@@ -2636,29 +2668,47 @@ class CustomDeliverableBuilder:
                     )
             return out
 
+        # New: Get min group size from config (default to 1 if not specified)
+        exact_group_size = cfg.get("exact_group_size")
+    
         if kind == "list[string]":
             gk, col = cfg.get("group_key", ""), cfg.get("col", "")
             if not gk or not col:
                 return []
+            
+            # Count group members first
             ref = this_row
-            items = []
-            for _, r in all_df.iterrows():
-                rd = r.to_dict()
-                if CustomDeliverableBuilder._row_matches_group(rd, ref, gk):
+            group_members = [
+                rd for _, r in all_df.iterrows() 
+                for rd in [r.to_dict()]
+                if CustomDeliverableBuilder._row_matches_group(rd, ref, gk)
+            ]
+            
+            # Only proceed if group matches exact size requirement (if specified)
+            if exact_group_size is None or len(group_members) == exact_group_size:
+                items = []
+                for rd in group_members:
                     v = CustomDeliverableBuilder._val_from_col(rd, col)
                     if v != "":
                         items.append(v)
-            return items
+                return items
+            return []
 
         if kind == "list[dict]":
             gk, pairs = cfg.get("group_key", ""), cfg.get("pairs", [])
             if not gk or not pairs:
                 return []
+            
             ref = this_row
-            items = []
-            for _, r in all_df.iterrows():
-                rd = r.to_dict()
-                if CustomDeliverableBuilder._row_matches_group(rd, ref, gk):
+            group_members = [
+                rd for _, r in all_df.iterrows() 
+                for rd in [r.to_dict()]
+                if CustomDeliverableBuilder._row_matches_group(rd, ref, gk)
+            ]
+            
+            if exact_group_size is None or len(group_members) == exact_group_size:
+                items = []
+                for rd in group_members:
                     d = {}
                     for pair in pairs:
                         k = (pair.get("key") or "").strip()
@@ -2669,18 +2719,25 @@ class CustomDeliverableBuilder:
                                 if col else ""
                             )
                     items.append(d)
-            return items
+                return items
+            return []
 
         if kind == "dict[list[dict]]":
             top_key = (cfg.get("top_key") or "items").strip() or "items"
             gk, pairs = cfg.get("group_key", ""), cfg.get("pairs", [])
             if not gk or not pairs:
                 return {top_key: []}
+            
             ref = this_row
-            items = []
-            for _, r in all_df.iterrows():
-                rd = r.to_dict()
-                if CustomDeliverableBuilder._row_matches_group(rd, ref, gk):
+            group_members = [
+                rd for _, r in all_df.iterrows() 
+                for rd in [r.to_dict()]
+                if CustomDeliverableBuilder._row_matches_group(rd, ref, gk)
+            ]
+            
+            if exact_group_size is None or len(group_members) == exact_group_size:
+                items = []
+                for rd in group_members:
                     d = {}
                     for pair in pairs:
                         k = (pair.get("key") or "").strip()
@@ -2691,9 +2748,11 @@ class CustomDeliverableBuilder:
                                 if col else ""
                             )
                     items.append(d)
-            return {top_key: items}
+                return {top_key: items}
+            return {top_key: []}
 
         return "__LEAVE_SKELETON__"
+
 
     @staticmethod
     def render_interface(custom_tab) -> None:
@@ -2712,18 +2771,52 @@ class CustomDeliverableBuilder:
                 st.info("Upload a schema to start.")
                 st.stop()
 
+            # --- NEW: robust unwrapping of common wrappers or naked schema roots ---
+            def _unwrap_schema_root(s: dict) -> dict:
+                # Common wrappers we've seen
+                for key in ("outputSchema", "schema"):
+                    if isinstance(s, dict) and key in s and isinstance(s[key], dict):
+                        return s[key]
+                # If it already looks like a Draft-07 schema with properties, keep as-is
+                if isinstance(s, dict) and ("properties" in s or "type" in s or "$schema" in s):
+                    return s
+                # Some files embed under components/schemas/<Name>
+                node = s
+                for k in ("components", "schemas"):
+                    if isinstance(node, dict) and k in node:
+                        node = node[k]
+                    else:
+                        node = None
+                        break
+                if isinstance(node, dict) and node:
+                    # Take the first schema object under components.schemas
+                    first = next((v for v in node.values() if isinstance(v, dict)), None)
+                    if first:
+                        return first
+                # Fallback: return original
+                return s
+
+            schema_root = _unwrap_schema_root(schema_json)
+
+            # Extract leaves from the true root
+            leaves, typemap = CustomDeliverableBuilder.gather_schema_leaves(schema_root)
+
+
             data_csv = st.session_state.get("data_csv", pd.DataFrame())
             if data_csv.empty:
                 st.error("CSV empty – load RLHF Viewer first.")
                 st.stop()
 
             # Extract schema information
-            leaves, typemap = CustomDeliverableBuilder.gather_schema_leaves(schema_json)
+            # leaves, typemap = CustomDeliverableBuilder.gather_schema_leaves(schema_json)
 
             # Initialize session state
             st.session_state.setdefault("use_custom_struct", False)
             st.session_state.setdefault("ds_overrides", {})
             st.session_state.setdefault("schema_mapping", {})
+            st.session_state.setdefault("grouping_enabled", False)
+            st.session_state.setdefault("grouping_column", "")
+            st.session_state.setdefault("grouping_min_size", 1)
 
             # Toggle callback
             def toggle_callback():
@@ -2754,7 +2847,29 @@ class CustomDeliverableBuilder:
             # Mode selection
             if use_custom:
                 st.success("🧩 **Custom Structure Mode** - Advanced field configuration active")
-                
+
+                 # Master grouping controls
+                with st.expander("🔢 Master Grouping Configuration", expanded=True):
+                    st.session_state.grouping_enabled = st.toggle(
+                        "Enable record grouping",
+                        value=st.session_state.grouping_enabled,
+                        help="Group records before building JSON structure"
+                    )
+                    
+                    if st.session_state.grouping_enabled:
+                        st.session_state.grouping_column = st.selectbox(
+                            "Group by column",
+                            options=[c for c in csv_cols if c],  # Exclude empty option
+                            index=0,
+                            key="grouping_column_select"
+                        )
+                        
+                        st.session_state.grouping_min_size = st.number_input(
+                            "Minimum records per group",
+                            min_value=1,
+                            value=1,
+                            help="Only include groups with at least this many records"
+                        ) 
                 # Ensure all leaves are initialized
                 for p in leaves:
                     if p not in st.session_state.ds_overrides:
@@ -2847,36 +2962,40 @@ class CustomDeliverableBuilder:
 
                         # Grouping for list kinds
                         if kind in ("list[string]", "list[dict]", "dict[list[dict]]"):
-                            c1, c2 = st.columns(2)
-                            with c1:
-                                current_group_key = ov.get("group_key", "")
-                                group_index = (
-                                    csv_cols.index(current_group_key) 
-                                    if current_group_key in csv_cols 
-                                    else 0
-                                )
+                            if st.session_state.grouping_enabled:
+                                # Use master grouping settings
+                                ov.update({
+                                    "group_key": st.session_state.grouping_column,
+                                    "min_group_size": st.session_state.grouping_min_size
+                                })
+                                st.info(f"Using master grouping by: {st.session_state.grouping_column}")
                                 
-                                ov["group_key"] = st.selectbox(
-                                    "Group by column",
-                                    options=csv_cols,
-                                    index=group_index,
-                                    key=f"group_key_{_safe_key(p)}"
-                                )
-                            with c2:
+                                # Only show field-specific config
                                 if kind == "list[string]":
-                                    current_ls_col = ov.get("col", "")
-                                    ls_col_index = (
-                                        csv_cols.index(current_ls_col) 
-                                        if current_ls_col in csv_cols 
-                                        else 0
-                                    )
-                                    
                                     ov["col"] = st.selectbox(
-                                        "Element column (string)",
+                                        "Value column",
                                         options=csv_cols,
-                                        index=ls_col_index,
-                                        key=f"ls_col_{_safe_key(p)}"
+                                        index=0,
+                                        key=f"col_{_safe_key(p)}"
                                     )
+                            else:
+                                # Original per-field grouping config
+                                c1, c2 = st.columns(2)
+                                with c1:
+                                    ov["group_key"] = st.selectbox(
+                                        "Group by column",
+                                        options=csv_cols,
+                                        index=0,
+                                        key=f"group_key_{_safe_key(p)}"
+                                    )
+                                with c2:
+                                    if kind == "list[string]":
+                                        ov["col"] = st.selectbox(
+                                            "Value column",
+                                            options=csv_cols,
+                                            index=0,
+                                            key=f"col_{_safe_key(p)}"
+                                        )
                             CustomDeliverableBuilder._set_override(p, ov)
 
                         # Dict key→column pairs
@@ -3034,18 +3153,36 @@ class CustomDeliverableBuilder:
                 filled_list = []
                 
                 if use_custom:
-                    for _, row in data_csv.iterrows():
-                        this = copy.deepcopy(skeleton)
-                        rd = row.to_dict()
-                        for p in leaves:
-                            ov = CustomDeliverableBuilder._get_override(p)
-                            kind = ov.get("kind", "schema")
-                            val = CustomDeliverableBuilder._materialize_struct_value(
-                                p, kind, ov, rd, data_csv, typemap
-                            )
-                            if val != "__LEAVE_SKELETON__":
-                                CustomDeliverableBuilder.set_by_path(this, p, val)
-                        filled_list.append(this)
+                    if st.session_state.grouping_enabled:
+                        # Grouped generation logic
+                        grouped = data_csv.groupby(st.session_state.grouping_column)
+                        for name, group in grouped:
+                            if len(group) >= st.session_state.grouping_min_size:
+                                this = copy.deepcopy(skeleton)
+                                for p in leaves:
+                                    ov = CustomDeliverableBuilder._get_override(p)
+                                    kind = ov.get("kind", "schema")
+                                    # Apply to first row in group
+                                    val = CustomDeliverableBuilder._materialize_struct_value(
+                                        p, kind, ov, group.iloc[0].to_dict(), group, typemap
+                                    )
+                                    if val != "__LEAVE_SKELETON__":
+                                        CustomDeliverableBuilder.set_by_path(this, p, val)
+                                filled_list.append(this)
+                    else:
+                        # Original row-by-row generation
+                        for _, row in data_csv.iterrows():
+                            this = copy.deepcopy(skeleton)
+                            rd = row.to_dict()
+                            for p in leaves:
+                                ov = CustomDeliverableBuilder._get_override(p)
+                                kind = ov.get("kind", "schema")
+                                val = CustomDeliverableBuilder._materialize_struct_value(
+                                    p, kind, ov, rd, data_csv, typemap
+                                )
+                                if val != "__LEAVE_SKELETON__":
+                                    CustomDeliverableBuilder.set_by_path(this, p, val)
+                            filled_list.append(this)
                 else:
                     for _, row in data_csv.iterrows():
                         this = copy.deepcopy(skeleton)
@@ -3242,13 +3379,11 @@ class UIComponents:
                         if other_fields:
                             st.markdown("**Additional Fields**")
                             for field, value in other_fields.items():
-                                with st.container():  # ✅ container instead of expander
-                                    st.markdown(f"**▸ {field}**")
+                                with st.expander(f"▸ {field}", expanded=False):
                                     if isinstance(value, (dict, list)):
                                         st.json(value)
                                     else:
                                         st.write(value)
-
                     elif role == "Assistant":
                         # Ideal response
                         ideal_response = msg.get("signal", {}).get("ideal_response")
