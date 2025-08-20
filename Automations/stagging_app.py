@@ -473,6 +473,35 @@ class CustomDeliverableBuilder:
             "boolean": False,
             "string": ""
         }.get(jtype, "")
+    
+    @staticmethod
+    def _normalize_override(ov: Dict[str, Any]) -> Dict[str, Any]:
+        ov = ov or {}
+        return {
+            "kind": ov.get("kind", "schema"),
+            "col": ov.get("col", ""),
+            "pairs": ov.get("pairs", []),
+            "group_key": ov.get("group_key", ""),
+            "top_key": ov.get("top_key", "items"),
+            "children": ov.get("children", {}),   # for dict[nested]
+            "item": ov.get("item", None),         # for list[nested]
+            "exact_group_size": ov.get("exact_group_size", None),
+            "min_group_size": ov.get("min_group_size", None)
+        }
+    
+    @staticmethod
+    def _kind_default(kind: str) -> Any:
+        base = {
+            "schema": "",
+            "string": "",
+            "dict": {},
+            "list[string]": [],
+            "list[dict]": [],
+            "dict[list[dict]]": {"items": []},
+            "dict[nested]": {},
+            "list[nested]": []
+        }
+        return base.get(kind, "")
 
     @staticmethod
     def _coerce(val: Any, jtype: str) -> Any:
@@ -505,6 +534,126 @@ class CustomDeliverableBuilder:
         return val
 
     # ------------------------------ Schema Helpers ------------------------------
+    @staticmethod
+    def _materialize_struct_value(
+        path: str,
+        kind: str,
+        cfg: Dict[str, Any],
+        this_row: Dict[str, Any],
+        all_df: pd.DataFrame,
+        typemap: Dict[str, Union[str, List[str]]]
+    ) -> Any:
+        if kind == "schema":
+            col = cfg.get("col", "")
+            if not col:
+                return "__LEAVE_SKELETON__"
+            jtype = typemap.get(path, "string")
+            jtype = jtype[0] if isinstance(jtype, list) else jtype
+            return CustomDeliverableBuilder._coerce(
+                CustomDeliverableBuilder._val_from_col(this_row, col),
+                str(jtype)
+            )
+
+        if kind == "string":
+            col = cfg.get("col", "")
+            return (
+                CustomDeliverableBuilder._val_from_col(this_row, col)
+                if col else "__LEAVE_SKELETON__"
+            )
+
+        if kind == "dict":
+            pairs = cfg.get("pairs", [])
+            if not pairs:
+                return {}
+            out = {}
+            for pair in pairs:
+                k = (pair.get("key") or "").strip()
+                col = pair.get("col", "")
+                if k:
+                    out[k] = (
+                        CustomDeliverableBuilder._val_from_col(this_row, col)
+                        if col else ""
+                    )
+            return out
+
+        exact_group_size = cfg.get("exact_group_size")
+
+        if kind == "list[string]":
+            gk, col = cfg.get("group_key", ""), cfg.get("col", "")
+            if not gk or not col:
+                return []
+            ref = this_row
+            group_members = [
+                rd for _, r in all_df.iterrows()
+                for rd in [r.to_dict()]
+                if CustomDeliverableBuilder._row_matches_group(rd, ref, gk)
+            ]
+            if exact_group_size is None or len(group_members) == exact_group_size:
+                items = []
+                for rd in group_members:
+                    v = CustomDeliverableBuilder._val_from_col(rd, col)
+                    if v != "":
+                        items.append(v)
+                return items
+            return []
+
+        if kind == "list[dict]":
+            gk, pairs = cfg.get("group_key", ""), cfg.get("pairs", [])
+            if not gk or not pairs:
+                return []
+            ref = this_row
+            group_members = [
+                rd for _, r in all_df.iterrows()
+                for rd in [r.to_dict()]
+                if CustomDeliverableBuilder._row_matches_group(rd, ref, gk)
+            ]
+            if exact_group_size is None or len(group_members) == exact_group_size:
+                items = []
+                for rd in group_members:
+                    d = {}
+                    for pair in pairs:
+                        k = (pair.get("key") or "").strip()
+                        col = pair.get("col", "")
+                        if k:
+                            d[k] = (
+                                CustomDeliverableBuilder._val_from_col(rd, col)
+                                if col else ""
+                            )
+                    items.append(d)
+                return items
+            return []
+
+        if kind == "dict[list[dict]]":
+            top_key = (cfg.get("top_key") or "items").strip() or "items"
+            gk, pairs = cfg.get("group_key", ""), cfg.get("pairs", [])
+            if not gk or not pairs:
+                return {top_key: []}
+            ref = this_row
+            group_members = [
+                rd for _, r in all_df.iterrows()
+                for rd in [r.to_dict()]
+                if CustomDeliverableBuilder._row_matches_group(rd, ref, gk)
+            ]
+            if exact_group_size is None or len(group_members) == exact_group_size:
+                items = []
+                for rd in group_members:
+                    d = {}
+                    for pair in pairs:
+                        k = (pair.get("key") or "").strip()
+                        col = pair.get("col", "")
+                        if k:
+                            d[k] = (
+                                CustomDeliverableBuilder._val_from_col(rd, col)
+                                if col else ""
+                            )
+                    items.append(d)
+                return {top_key: items}
+            return {top_key: []}
+
+        # Fallback for unknown kinds
+        return "__LEAVE_SKELETON__"
+
+
     @staticmethod
     def _unwrap_schema_root(s: dict) -> dict:
         """Unwrap common wrappers or nested OpenAPI-style components."""
@@ -767,31 +916,74 @@ class CustomDeliverableBuilder:
 
     @staticmethod
     def set_by_path(root: Any, path: str, value: Any) -> None:
+        """
+        Robustly set a value at dotted path, auto-coercing intermediate containers:
+        - If we need a list but find a dict/scalar → replace in parent with []
+        - If we need a dict but find a list/scalar → replace in parent with {}
+        This prevents collisions when a parent was previously set to a scalar.
+        """
         parts = path.split(".")
         current = root
+        parent = None
+        parent_key = None
+        parent_is_index = False
+
+        def _install_in_parent(new_container):
+            nonlocal current
+            if parent is None:
+                # Root should be a dict; if not, reset it safely
+                if isinstance(root, dict):
+                    # reset root in-place
+                    root.clear()
+                    root.update(new_container if isinstance(new_container, dict) else {})
+                    current = root if isinstance(new_container, dict) else new_container
+                else:
+                    # extremely rare; just point current to the new container
+                    current = new_container
+            else:
+                if parent_is_index:
+                    while len(parent) <= parent_key:
+                        parent.append(None)
+                    parent[parent_key] = new_container
+                else:
+                    parent[parent_key] = new_container
+                current = new_container
+
         for i, part in enumerate(parts):
             is_last = i == len(parts) - 1
             is_index = part.isdigit()
             key = int(part) if is_index else part
-            if is_last:
-                if is_index:
-                    while len(current) <= key:
-                        current.append(None)
-                    current[key] = value
-                else:
-                    current[key] = value
-                return
-            next_type = [] if parts[i + 1].isdigit() else {}
+
+            # What container is needed for the *next* hop?
+            next_container = [] if (not is_last and parts[i + 1].isdigit()) else {}
+
             if is_index:
+                # Ensure current is a list
+                if not isinstance(current, list):
+                    _install_in_parent([])
+                # current is a list now
                 while len(current) <= key:
-                    current.append(copy.deepcopy(next_type))
+                    current.append(copy.deepcopy(next_container))
+                if is_last:
+                    current[key] = value
+                    return
                 if not isinstance(current[key], (list, dict)):
-                    current[key] = copy.deepcopy(next_type)
+                    current[key] = copy.deepcopy(next_container)
+                parent, parent_key, parent_is_index = current, key, True
                 current = current[key]
             else:
+                # Ensure current is a dict
+                if not isinstance(current, dict):
+                    _install_in_parent({})
+                # current is a dict now
+                if is_last:
+                    current[key] = value
+                    return
                 if key not in current or not isinstance(current[key], (list, dict)):
-                    current[key] = copy.deepcopy(next_type)
+                    current[key] = copy.deepcopy(next_container)
+                parent, parent_key, parent_is_index = current, key, False
                 current = current[key]
+
 
     @staticmethod
     def _placeholder_for(col: str) -> str:
@@ -799,9 +991,26 @@ class CustomDeliverableBuilder:
 
     @staticmethod
     def _type_default(jtype: Union[str, List[str]]) -> Any:
+        def _d(t: str) -> Any:
+            return {
+                "object": {},
+                "array": [],
+                "integer": 0,
+                "number": 0.0,
+                "boolean": False,
+                "string": ""
+            }.get(t, "")
         if isinstance(jtype, list):
-            jtype = jtype[0] if jtype else "string"
-        return CustomDeliverableBuilder._default_for(jtype)
+            # Prefer containers first to keep parents expandable
+            for t in ("object", "array"):
+                if t in jtype:
+                    return _d(t)
+            for t in ("string", "number", "integer", "boolean"):
+                if t in jtype:
+                    return _d(t)
+            return _d(jtype[0]) if jtype else ""
+        return _d(jtype)
+
 
     @staticmethod
     def _get_override(path: str) -> Dict[str, Any]:
@@ -810,7 +1019,9 @@ class CustomDeliverableBuilder:
             "col": "",
             "pairs": [],
             "group_key": "",
-            "top_key": "items"
+            "top_key": "items",
+            "children": {},   # <-- NEW
+            "item": None      # <-- NEW
         })
 
     @staticmethod
@@ -832,110 +1043,301 @@ class CustomDeliverableBuilder:
     def _val_from_col(row: Dict[str, Any], col: str) -> str:
         v = row.get(col, "")
         return "" if v is None or (isinstance(v, float) and pd.isna(v)) else v
-
+    
     @staticmethod
-    def _materialize_struct_value(
+    def _skeleton_for_override(
         path: str,
-        kind: str,
-        cfg: Dict[str, Any],
-        this_row: Dict[str, Any],
-        all_df: pd.DataFrame,
+        ov: Dict[str, Any],
         typemap: Dict[str, Union[str, List[str]]]
     ) -> Any:
+        ov = CustomDeliverableBuilder._normalize_override(ov)
+        kind = ov["kind"]
+
+        # simple kinds mirror the existing preview logic
         if kind == "schema":
-            col = cfg.get("col", "")
-            if not col:
-                return "__LEAVE_SKELETON__"
-            jtype = typemap.get(path, "string")
-            jtype = jtype[0] if isinstance(jtype, list) else jtype
-            return CustomDeliverableBuilder._coerce(
-                CustomDeliverableBuilder._val_from_col(this_row, col),
-                str(jtype)
-            )
+            col = ov.get("col", "")
+            return CustomDeliverableBuilder._placeholder_for(col) if col else CustomDeliverableBuilder._type_default(typemap.get(path, "string"))
 
         if kind == "string":
-            col = cfg.get("col", "")
-            return CustomDeliverableBuilder._val_from_col(this_row, col) if col else "__LEAVE_SKELETON__"
+            col = ov.get("col", "")
+            return CustomDeliverableBuilder._placeholder_for(col) if col else ""
 
         if kind == "dict":
-            pairs = cfg.get("pairs", [])
-            if not pairs:
-                return {}
-            out = {}
-            for pair in pairs:
+            ex = {}
+            for pair in ov.get("pairs", []):
                 k = (pair.get("key") or "").strip()
                 col = pair.get("col", "")
                 if k:
-                    out[k] = CustomDeliverableBuilder._val_from_col(this_row, col) if col else ""
-            return out
-
-        exact_group_size = cfg.get("exact_group_size")
+                    ex[k] = CustomDeliverableBuilder._placeholder_for(col) if col else ""
+            return ex
 
         if kind == "list[string]":
-            gk, col = cfg.get("group_key", ""), cfg.get("col", "")
-            if not gk or not col:
-                return []
-            ref = this_row
-            group_members = [
-                rd for _, r in all_df.iterrows()
-                for rd in [r.to_dict()]
-                if CustomDeliverableBuilder._row_matches_group(rd, ref, gk)
-            ]
-            if exact_group_size is None or len(group_members) == exact_group_size:
-                items = []
-                for rd in group_members:
-                    v = CustomDeliverableBuilder._val_from_col(rd, col)
-                    if v != "":
-                        items.append(v)
-                return items
-            return []
+            col = ov.get("col", "")
+            return [CustomDeliverableBuilder._placeholder_for(col) if col else "", "..."]
 
         if kind == "list[dict]":
-            gk, pairs = cfg.get("group_key", ""), cfg.get("pairs", [])
-            if not gk or not pairs:
-                return []
-            ref = this_row
-            group_members = [
-                rd for _, r in all_df.iterrows()
-                for rd in [r.to_dict()]
-                if CustomDeliverableBuilder._row_matches_group(rd, ref, gk)
-            ]
-            if exact_group_size is None or len(group_members) == exact_group_size:
-                items = []
-                for rd in group_members:
-                    d = {}
-                    for pair in pairs:
-                        k = (pair.get("key") or "").strip()
-                        col = pair.get("col", "")
-                        if k:
-                            d[k] = CustomDeliverableBuilder._val_from_col(rd, col) if col else ""
-                    items.append(d)
-                return items
-            return []
+            ex = {}
+            for pair in ov.get("pairs", []):
+                k = (pair.get("key") or "").strip()
+                col = pair.get("col", "")
+                if k:
+                    ex[k] = CustomDeliverableBuilder._placeholder_for(col) if col else ""
+            return [ex, "..."]
 
         if kind == "dict[list[dict]]":
-            top_key = (cfg.get("top_key") or "items").strip() or "items"
-            gk, pairs = cfg.get("group_key", ""), cfg.get("pairs", [])
-            if not gk or not pairs:
-                return {top_key: []}
+            top_key = (ov.get("top_key") or "items").strip() or "items"
+            ex = {}
+            for pair in ov.get("pairs", []):
+                k = (pair.get("key") or "").strip()
+                col = pair.get("col", "")
+                if k:
+                    ex[k] = CustomDeliverableBuilder._placeholder_for(col) if col else ""
+            return {top_key: [ex, "..."]}
+
+        # nested kinds
+        if kind == "dict[nested]":
+            out = {}
+            for child_key, child_ov in ov.get("children", {}).items():
+                out[child_key] = CustomDeliverableBuilder._skeleton_for_override(f"{path}.{child_key}", child_ov, typemap)
+            return out
+
+        if kind == "list[nested]":
+            item_ov = ov.get("item") or {"kind": "string", "col": ""}
+            ex = CustomDeliverableBuilder._skeleton_for_override(f"{path}[]", item_ov, typemap)
+            return [ex, "..."]
+
+        return CustomDeliverableBuilder._type_default(typemap.get(path, "string"))
+    
+    @staticmethod
+    def _edit_override_ui(path: str, ov: Dict[str, Any], csv_cols: List[str]) -> Dict[str, Any]:
+        ov = CustomDeliverableBuilder._normalize_override(ov)
+        kind = ov["kind"]
+
+        # Common helpers
+        def _select_value_col(label_key: str):
+            current_col = ov.get("col", "")
+            idx = csv_cols.index(current_col) if current_col in csv_cols else 0
+            ov["col"] = st.selectbox(label_key, options=csv_cols, index=idx, key=f"col_{_safe_key(path)}")
+            return ov
+
+        # Simple kinds use the existing UI:
+        if kind == "schema":
+            return _select_value_col("Value column")
+
+        if kind == "string":
+            return _select_value_col("Value column")
+
+        if kind in ("list[string]",):
+            # group config handled by caller (reuse your existing logic)
+            return _select_value_col("Value column")
+
+        if kind in ("dict", "list[dict]", "dict[list[dict]]"):
+            # Pairs editor is rendered by caller; nothing extra needed here.
+            return ov
+
+        # --- dict[nested] editor ---
+        if kind == "dict[nested]":
+            st.caption("Define nested keys for this dict.")
+            # Add child
+            c1, c2 = st.columns([2,1])
+            with c1:
+                new_key = st.text_input("Add child key", value="", key=f"new_child_key_{_safe_key(path)}")
+            with c2:
+                if st.button("➕ Add child", key=f"add_child_{_safe_key(path)}") and new_key.strip():
+                    if "children" not in ov or not isinstance(ov["children"], dict):
+                        ov["children"] = {}
+                    if new_key not in ov["children"]:
+                        ov["children"][new_key] = {"kind": "string", "col": ""}
+
+            # Render each child
+            to_delete = []
+            for child_key, child_ov in (ov.get("children") or {}).items():
+                with st.expander(f"🔹 {child_key}", expanded=False):
+                    # choose kind
+                    kind_opts = ["schema", "string", "dict", "list[string]", "list[dict]", "dict[list[dict]]", "dict[nested]", "list[nested]"]
+                    ck = child_ov.get("kind", "string")
+                    kind_idx = kind_opts.index(ck) if ck in kind_opts else 1
+                    new_kind = st.selectbox("Kind", options=kind_opts, index=kind_idx, key=f"kind_{_safe_key(path)}_{_safe_key(child_key)}")
+                    if new_kind != ck:
+                        child_ov = {"kind": new_kind, "col": "", "pairs": [], "children": {}, "item": None, "group_key": "", "top_key": "items"}
+
+                    # simple config for some kinds:
+                    if new_kind in ("schema", "string", "list[string]"):
+                        col_list = csv_cols
+                    else:
+                        col_list = csv_cols  # still used in deeper editors if needed
+
+                    # pairs for dict/list[dict]/dict[list[dict]]
+                    if new_kind in ("dict", "list[dict]", "dict[list[dict]]"):
+                        st.caption("Key → column pairs")
+                        pairs = child_ov.get("pairs", []) or [{"key": "", "col": ""}]
+                        edit_df = st.data_editor(
+                            pd.DataFrame(pairs),
+                            num_rows="dynamic",
+                            column_config={
+                                "key": st.column_config.TextColumn("Key"),
+                                "col": st.column_config.SelectboxColumn("CSV Column", options=col_list)
+                            },
+                            key=f"pairs_{_safe_key(path)}_{_safe_key(child_key)}"
+                        )
+                        child_ov["pairs"] = edit_df.to_dict(orient="records")
+
+                        if new_kind == "dict[list[dict]]":
+                            child_ov["top_key"] = st.text_input(
+                                "Top-level key", value=child_ov.get("top_key", "items"),
+                                key=f"topkey_{_safe_key(path)}_{_safe_key(child_key)}"
+                            )
+
+                    # value column for schema/string/list[string]
+                    if new_kind in ("schema", "string", "list[string]"):
+                        sel = st.selectbox(
+                            "Value column",
+                            options=col_list,
+                            index=(col_list.index(child_ov.get("col", "")) if child_ov.get("col", "") in col_list else 0),
+                            key=f"col_{_safe_key(path)}_{_safe_key(child_key)}"
+                        )
+                        child_ov["col"] = sel
+
+                    # nested recursion editors
+                    if new_kind in ("dict[nested]", "list[nested]"):
+                        # push down to nested editor
+                        child_ov = CustomDeliverableBuilder._edit_override_ui(f"{path}.{child_key}", child_ov, csv_cols)
+
+                    # delete option
+                    if st.button("🗑️ Remove this child", key=f"del_{_safe_key(path)}_{_safe_key(child_key)}"):
+                        to_delete.append(child_key)
+
+                    ov["children"][child_key] = child_ov
+
+            for k in to_delete:
+                ov["children"].pop(k, None)
+            return ov
+
+        # --- list[nested] editor ---
+        if kind == "list[nested]":
+            st.caption("Define the item structure for this list.")
+            # item override default
+            if not ov.get("item"):
+                ov["item"] = {"kind": "string", "col": ""}
+
+            # show nested editor for item
+            with st.expander("🧱 Item structure", expanded=True):
+                ov["item"] = CustomDeliverableBuilder._edit_override_ui(f"{path}[]", ov["item"], csv_cols)
+
+            # grouping config (per-field; master grouping still overrides when enabled)
+            st.markdown("**Optional local grouping** (ignored if master grouping is enabled)")
+            c1, c2 = st.columns(2)
+            with c1:
+                ov["group_key"] = st.selectbox(
+                    "Group by column (optional)",
+                    options=[""] + [c for c in csv_cols if c],
+                    index=0,
+                    key=f"listnested_group_{_safe_key(path)}"
+                )
+            with c2:
+                ov["min_group_size"] = st.number_input(
+                    "Minimum records per group", min_value=1, value=1,
+                    key=f"listnested_minsize_{_safe_key(path)}"
+                )
+            return ov
+
+        return ov
+
+
+    @staticmethod
+    def _materialize_value_recursive(
+        path: str,
+        ov: Dict[str, Any],
+        this_row: Dict[str, Any],
+        all_df: pd.DataFrame,
+        typemap: Dict[str, Union[str, List[str]]],
+        *,
+        master_grouping_enabled: bool = False,
+        master_group_key: str = "",
+        master_min_size: int = 1
+    ) -> Any:
+        ov = CustomDeliverableBuilder._normalize_override(ov)
+        kind = ov["kind"]
+
+        # Reuse existing simple kinds via the old dispatcher
+        simple_kinds = {"schema", "string", "dict", "list[string]", "list[dict]", "dict[list[dict]]"}
+        if kind in simple_kinds:
+            return CustomDeliverableBuilder._materialize_struct_value(
+                path, kind, ov, this_row, all_df, typemap
+            )
+
+        # --- dict[nested] -----------------------------------------------------------
+        if kind == "dict[nested]":
+            out = {}
+            for child_key, child_ov in ov.get("children", {}).items():
+                val = CustomDeliverableBuilder._materialize_value_recursive(
+                    f"{path}.{child_key}",
+                    child_ov,
+                    this_row,
+                    all_df,
+                    typemap,
+                    master_grouping_enabled=master_grouping_enabled,
+                    master_group_key=master_group_key,
+                    master_min_size=master_min_size
+                )
+                if val == "__LEAVE_SKELETON__":
+                    val = CustomDeliverableBuilder._kind_default(child_ov.get("kind", "string"))
+                out[child_key] = val
+            return out
+
+        # --- list[nested] -----------------------------------------------------------
+        if kind == "list[nested]":
+            item_ov = ov.get("item") or {"kind": "string", "col": ""}
+            # Decide grouping
+            use_master = master_grouping_enabled
+            group_key = (master_group_key if use_master else ov.get("group_key", "")).strip()
+            min_size = (master_min_size if use_master else ov.get("min_group_size") or 1)
+            exact_group_size = ov.get("exact_group_size")
+
+            # If no grouping configured anywhere → single item from current row
+            if not group_key:
+                val = CustomDeliverableBuilder._materialize_value_recursive(
+                    f"{path}[]",
+                    item_ov,
+                    this_row,
+                    all_df,
+                    typemap,
+                    master_grouping_enabled=master_grouping_enabled,
+                    master_group_key=master_group_key,
+                    master_min_size=master_min_size
+                )
+                if val == "__LEAVE_SKELETON__":
+                    val = CustomDeliverableBuilder._kind_default(item_ov.get("kind", "string"))
+                return [val]
+
+            # Grouped mode
             ref = this_row
             group_members = [
                 rd for _, r in all_df.iterrows()
                 for rd in [r.to_dict()]
-                if CustomDeliverableBuilder._row_matches_group(rd, ref, gk)
+                if CustomDeliverableBuilder._row_matches_group(rd, ref, group_key)
             ]
-            if exact_group_size is None or len(group_members) == exact_group_size:
-                items = []
-                for rd in group_members:
-                    d = {}
-                    for pair in pairs:
-                        k = (pair.get("key") or "").strip()
-                        col = pair.get("col", "")
-                        if k:
-                            d[k] = CustomDeliverableBuilder._val_from_col(rd, col) if col else ""
-                    items.append(d)
-                return {top_key: items}
-            return {top_key: []}
+            if exact_group_size is not None and len(group_members) != exact_group_size:
+                return []
+            if len(group_members) < (min_size or 1):
+                return []
+
+            items = []
+            for rd in group_members:
+                val = CustomDeliverableBuilder._materialize_value_recursive(
+                    f"{path}[]",
+                    item_ov,
+                    rd,
+                    all_df,
+                    typemap,
+                    master_grouping_enabled=master_grouping_enabled,
+                    master_group_key=master_group_key,
+                    master_min_size=master_min_size
+                )
+                if val == "__LEAVE_SKELETON__":
+                    val = CustomDeliverableBuilder._kind_default(item_ov.get("kind", "string"))
+                items.append(val)
+            return items
 
         return "__LEAVE_SKELETON__"
 
@@ -1065,7 +1467,7 @@ class CustomDeliverableBuilder:
             def toggle_callback():
                 if st.session_state.use_custom_struct:
                     st.session_state.ds_overrides = {
-                        p: {"kind": "schema", "col": "", "pairs": [], "group_key": "", "top_key": "items"}
+                        p: {"kind": "schema", "col": "", "pairs": [], "group_key": "", "top_key": "items", "children": {}, "item": None}
                         for p in leaves
                     }
 
@@ -1128,28 +1530,37 @@ class CustomDeliverableBuilder:
                 visible = [p for p in leaves if ft in p.lower()] if ft else leaves
 
                 kind_labels = {
-                    "schema": "Schema (typed default; or coerce from chosen column)",
-                    "string": "string (raw from chosen column)",
-                    "dict": "dict (key → column)",
-                    "list[string]": "list[string] (group & column)",
-                    "list[dict]": "list[dict] (group & pairs)",
-                    "dict[list[dict]]": "dict[list[dict]] (top key, group & pairs)"
-                }
+                        "schema": "Schema (typed default; or coerce from chosen column)",
+                        "string": "string (raw from chosen column)",
+                        "dict": "dict (key → column)",
+                        "list[string]": "list[string] (group & column)",
+                        "list[dict]": "list[dict] (group & pairs)",
+                        "dict[list[dict]]": "dict[list[dict]] (top key, group & pairs)",
+                        # NEW:
+                        "dict[nested]": "dict[nested] (define nested child keys & kinds)",
+                        "list[nested]": "list[nested] (define nested item structure; optional grouping)",
+                    }
 
                 for p in visible:
                     ov = CustomDeliverableBuilder._get_override(p)
                     with st.expander(f"📝 {p}", expanded=expand_all):
                         current_kind = ov.get("kind", "schema")
-                        kind_options = ["schema", "string", "dict", "list[string]", "list[dict]", "dict[list[dict]]"]
+                        kind_options = ["schema", "string", "dict", "list[string]", "list[dict]", "dict[list[dict]]", "dict[nested]", "list[nested]"]
                         kind_index = kind_options.index(current_kind) if current_kind in kind_options else 0
 
                         kind = st.selectbox(
-                            "Structure type",
-                            options=kind_options,
-                            format_func=lambda k: kind_labels[k],
-                            index=kind_index,
-                            key=f"kind_{_safe_key(p)}"
-                        )
+                                "Structure type",
+                                options=kind_options,
+                                # SAFE formatter to avoid KeyError even if options evolve:
+                                format_func=lambda k: kind_labels.get(k, k),
+                                index=kind_index,
+                                key=f"kind_{_safe_key(p)}"
+                            )
+
+                        if kind in ("dict[nested]", "list[nested]"):
+                            ov = CustomDeliverableBuilder._edit_override_ui(p, ov, csv_cols)
+                            CustomDeliverableBuilder._set_override(p, ov)
+
                         if kind != current_kind:
                             ov = {"kind": kind, "col": "", "pairs": [], "group_key": "", "top_key": "items"}
                             CustomDeliverableBuilder._set_override(p, ov)
@@ -1298,6 +1709,14 @@ class CustomDeliverableBuilder:
                             if k:
                                 ex[k] = CustomDeliverableBuilder._placeholder_for(col) if col else ""
                         CustomDeliverableBuilder.set_by_path(skeleton, p, {top_key: [ex, "..."]})
+                    
+                    elif kind == "dict[nested]":
+                        ex = CustomDeliverableBuilder._skeleton_for_override(p, ov, typemap)
+                        CustomDeliverableBuilder.set_by_path(skeleton, p, ex)
+
+                    elif kind == "list[nested]":
+                        ex = CustomDeliverableBuilder._skeleton_for_override(p, ov, typemap)
+                        CustomDeliverableBuilder.set_by_path(skeleton, p, ex)
                     else:
                         CustomDeliverableBuilder.set_by_path(
                             skeleton, p, CustomDeliverableBuilder._type_default(typemap.get(p, "string"))
@@ -1318,33 +1737,53 @@ class CustomDeliverableBuilder:
             if st.button("⚙️ Generate deliverables.json"):
                 filled_list = []
                 if use_custom:
+                    # --- grouped path ---
                     if st.session_state.grouping_enabled:
                         grouped = data_csv.groupby(st.session_state.grouping_column)
                         for name, group in grouped:
                             if len(group) >= st.session_state.grouping_min_size:
                                 this = copy.deepcopy(skeleton)
+
+                                # Use a reference row from this group
+                                ref_row = group.iloc[0].to_dict()  # <-- ADD this
+
                                 for p in leaves:
                                     ov = CustomDeliverableBuilder._get_override(p)
-                                    kind = ov.get("kind", "schema")
-                                    val = CustomDeliverableBuilder._materialize_struct_value(
-                                        p, kind, ov, group.iloc[0].to_dict(), group, typemap
+                                    # was: rd  (undefined)  ❌
+                                    val = CustomDeliverableBuilder._materialize_value_recursive(
+                                        p, ov,
+                                        ref_row,          # <-- FIX: pass ref_row
+                                        group,            # all_df for grouping-aware materialization
+                                        typemap,
+                                        master_grouping_enabled=True,
+                                        master_group_key=st.session_state.grouping_column,
+                                        master_min_size=st.session_state.grouping_min_size
                                     )
                                     if val != "__LEAVE_SKELETON__":
                                         CustomDeliverableBuilder.set_by_path(this, p, val)
+
                                 filled_list.append(this)
+
+                    # --- non-grouped path ---
                     else:
                         for _, row in data_csv.iterrows():
                             this = copy.deepcopy(skeleton)
-                            rd = row.to_dict()
+                            ref_row = row.to_dict()  # name consistently
+
                             for p in leaves:
                                 ov = CustomDeliverableBuilder._get_override(p)
-                                kind = ov.get("kind", "schema")
-                                val = CustomDeliverableBuilder._materialize_struct_value(
-                                    p, kind, ov, rd, data_csv, typemap
+                                val = CustomDeliverableBuilder._materialize_value_recursive(
+                                    p, ov,
+                                    ref_row,           # ref row for this item
+                                    data_csv,          # all_df
+                                    typemap,
+                                    master_grouping_enabled=False
                                 )
                                 if val != "__LEAVE_SKELETON__":
                                     CustomDeliverableBuilder.set_by_path(this, p, val)
+
                             filled_list.append(this)
+
                 else:
                     mapping = st.session_state["schema_mapping"]
                     for _, row in data_csv.iterrows():
@@ -1768,7 +2207,6 @@ def show_json_visualizer():
                 
                 # AI-powered analysis
                 if st.button("🧠 Analyze with AI", help="Get AI-powered insights about this JSON structure"):
-                    
                     OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
                     if not OPENAI_API_KEY:
                         st.error("❌ OpenAI API key not found in .env file")
